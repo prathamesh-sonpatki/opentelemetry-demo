@@ -8,24 +8,52 @@ import { Empty, PlaceOrderRequest } from '../../protos/demo';
 import { IProductCheckoutItem, IProductCheckout } from '../../types/Cart';
 import ProductCatalogService from '../../services/ProductCatalog.service';
 
-type TResponse = IProductCheckout | Empty;
+type TResponse = IProductCheckout | Empty | { error: string };
 
 const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
-  switch (method) {
-    case 'POST': {
-      const { currencyCode = '' } = query;
-      const orderData = body as PlaceOrderRequest;
-      const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
+  try {
+    if (method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' });
+    }
 
+    const { currencyCode = '' } = query;
+    if (!currencyCode) {
+      return res.status(400).json({ error: 'Currency code is required' });
+    }
+
+    const orderData = body as PlaceOrderRequest;
+    if (!orderData) {
+      return res.status(400).json({ error: 'Order data is required' });
+    }
+
+    const orderResponse = await CheckoutGateway.placeOrder(orderData);
+    if (!orderResponse?.order) {
+      return res.status(500).json({ error: 'Failed to place order' });
+    }
+
+    const { order: { items = [], ...order } = {} } = orderResponse;
+
+    try {
       const productList: IProductCheckoutItem[] = await Promise.all(
-        items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
-          const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+        items.map(async ({ item, cost }) => {
+          if (!item?.productId) {
+            throw new Error('Invalid product ID in order item');
+          }
+
+          const product = await ProductCatalogService.getProduct(
+            item.productId,
+            currencyCode as string
+          );
+
+          if (!product) {
+            throw new Error(`Product not found: ${item.productId}`);
+          }
 
           return {
             cost,
             item: {
-              productId,
-              quantity,
+              productId: item.productId,
+              quantity: item.quantity || 0,
               product,
             },
           };
@@ -33,11 +61,13 @@ const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResp
       );
 
       return res.status(200).json({ ...order, items: productList });
+    } catch (productError) {
+      console.error('Error processing products:', productError);
+      return res.status(500).json({ error: 'Failed to process product details' });
     }
-
-    default: {
-      return res.status(405).send('');
-    }
+  } catch (error) {
+    console.error('Checkout API error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 
