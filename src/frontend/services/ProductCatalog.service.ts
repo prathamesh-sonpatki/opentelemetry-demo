@@ -9,31 +9,65 @@ const defaultCurrencyCode = 'USD';
 
 const ProductCatalogService = () => ({
   async getProductPrice(price: Money, currencyCode: string) {
-    return !!currencyCode && currencyCode !== defaultCurrencyCode
-      ? await CurrencyGateway.convert(price, currencyCode)
-      : price;
+    if (!price) {
+      throw new Error('Invalid price data');
+    }
+
+    try {
+      return !!currencyCode && currencyCode !== defaultCurrencyCode
+        ? await CurrencyGateway.convert(price, currencyCode)
+        : price;
+    } catch (error) {
+      console.error('Currency conversion error:', error);
+      // Fall back to original price if conversion fails
+      return price;
+    }
   },
+
   async listProducts(currencyCode = 'USD') {
-    const { products: productList } = await ProductCatalogGateway.listProducts();
+    try {
+      const { products: productList } = await ProductCatalogGateway.listProducts();
 
-    return Promise.all(
-      productList.map(async product => {
-        const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
+      if (!productList?.length) {
+        throw new Error('No products available');
+      }
 
-        return {
-          ...product,
-          priceUsd,
-        };
-      })
-    );
+      return Promise.all(
+        productList.map(async product => {
+          const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
+
+          return {
+            ...product,
+            priceUsd,
+          };
+        })
+      );
+    } catch (error) {
+      console.error('List products error:', error);
+      throw new Error(`Failed to fetch product list: ${error.message}`);
+    }
   },
-  async getProduct(id: string, currencyCode = 'USD') {
-    const product = await ProductCatalogGateway.getProduct(id);
 
-    return {
-      ...product,
-      priceUsd: await this.getProductPrice(product.priceUsd!, currencyCode),
-    };
+  async getProduct(id: string, currencyCode = 'USD') {
+    if (!id) {
+      throw new Error('Product ID is required');
+    }
+
+    try {
+      const product = await ProductCatalogGateway.getProduct(id);
+      
+      if (!product) {
+        throw new Error(`Product not found: ${id}`);
+      }
+
+      return {
+        ...product,
+        priceUsd: await this.getProductPrice(product.priceUsd!, currencyCode),
+      };
+    } catch (error) {
+      console.error(`Get product error for ID ${id}:`, error);
+      throw new Error(`Failed to fetch product ${id}: ${error.message}`);
+    }
   },
 });
 
