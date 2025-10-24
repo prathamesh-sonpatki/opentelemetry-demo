@@ -13,6 +13,10 @@ const handler = async ({ method, query }: NextApiRequest, res: NextApiResponse<T
     case 'GET': {
       const { productId = '', currencyCode = '' } = query;
       const product = await ProductCatalogService.getProduct(productId as string, currencyCode as string);
+      
+      if (!product) {
+        return res.status(404).send(''); // Return 404 when product is null
+      }
 
       return res.status(200).json(product);
     }
