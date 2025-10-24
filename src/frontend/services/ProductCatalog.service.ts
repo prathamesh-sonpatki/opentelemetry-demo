@@ -7,33 +7,79 @@ import { Money } from '../protos/demo';
 
 const defaultCurrencyCode = 'USD';
 
+// Max retries for product catalog operations
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 const ProductCatalogService = () => ({
   async getProductPrice(price: Money, currencyCode: string) {
     return !!currencyCode && currencyCode !== defaultCurrencyCode
       ? await CurrencyGateway.convert(price, currencyCode)
       : price;
   },
+
   async listProducts(currencyCode = 'USD') {
-    const { products: productList } = await ProductCatalogGateway.listProducts();
+    let attempt = 0;
+    let lastError;
 
-    return Promise.all(
-      productList.map(async product => {
-        const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
+    while (attempt < MAX_RETRIES) {
+      try {
+        const { products: productList } = await ProductCatalogGateway.listProducts();
 
+        return Promise.all(
+          productList.map(async product => {
+            const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
+            return {
+              ...product,
+              priceUsd,
+            };
+          })
+        );
+      } catch (error) {
+        lastError = error;
+        // Only retry if it's a feature flag error
+        if (error.message?.includes('Feature Flag Enabled')) {
+          attempt++;
+          if (attempt < MAX_RETRIES) {
+            await sleep(RETRY_DELAY);
+            continue;
+          }
+        }
+        throw error;
+      }
+    }
+
+    throw lastError;
+  },
+
+  async getProduct(id: string, currencyCode = 'USD') {
+    let attempt = 0;
+    let lastError;
+
+    while (attempt < MAX_RETRIES) {
+      try {
+        const product = await ProductCatalogGateway.getProduct(id);
         return {
           ...product,
-          priceUsd,
+          priceUsd: await this.getProductPrice(product.priceUsd!, currencyCode),
         };
-      })
-    );
-  },
-  async getProduct(id: string, currencyCode = 'USD') {
-    const product = await ProductCatalogGateway.getProduct(id);
+      } catch (error) {
+        lastError = error;
+        // Only retry if it's a feature flag error
+        if (error.message?.includes('Feature Flag Enabled')) {
+          attempt++;
+          if (attempt < MAX_RETRIES) {
+            await sleep(RETRY_DELAY);
+            continue;
+          }
+        }
+        throw error;
+      }
+    }
 
-    return {
-      ...product,
-      priceUsd: await this.getProductPrice(product.priceUsd!, currencyCode),
-    };
+    throw lastError;
   },
 });
 
