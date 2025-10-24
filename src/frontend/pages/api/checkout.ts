@@ -8,36 +8,49 @@ import { Empty, PlaceOrderRequest } from '../../protos/demo';
 import { IProductCheckoutItem, IProductCheckout } from '../../types/Cart';
 import ProductCatalogService from '../../services/ProductCatalog.service';
 
-type TResponse = IProductCheckout | Empty;
+type TResponse = IProductCheckout | Empty | { error: string };
 
 const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
-  switch (method) {
-    case 'POST': {
-      const { currencyCode = '' } = query;
-      const orderData = body as PlaceOrderRequest;
-      const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
+  try {
+    switch (method) {
+      case 'POST': {
+        const { currencyCode = '' } = query;
+        const orderData = body as PlaceOrderRequest;
 
-      const productList: IProductCheckoutItem[] = await Promise.all(
-        items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
-          const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+        try {
+          const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
 
-          return {
-            cost,
-            item: {
-              productId,
-              quantity,
-              product,
-            },
-          };
-        })
-      );
+          const productList: IProductCheckoutItem[] = await Promise.all(
+            items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
+              const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
 
-      return res.status(200).json({ ...order, items: productList });
+              return {
+                cost,
+                item: {
+                  productId,
+                  quantity,
+                  product,
+                },
+              };
+            })
+          );
+
+          return res.status(200).json({ ...order, items: productList });
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('temporarily unavailable')) {
+            return res.status(503).json({ error: error.message });
+          }
+          throw error;
+        }
+      }
+
+      default: {
+        return res.status(405).send('');
+      }
     }
-
-    default: {
-      return res.status(405).send('');
-    }
+  } catch (error) {
+    console.error('Checkout error:', error);
+    return res.status(500).json({ error: 'An error occurred processing your order. Please try again.' });
   }
 };
 
