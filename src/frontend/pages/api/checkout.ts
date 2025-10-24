@@ -13,30 +13,52 @@ type TResponse = IProductCheckout | Empty;
 const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
   switch (method) {
     case 'POST': {
-      const { currencyCode = '' } = query;
-      const orderData = body as PlaceOrderRequest;
-      const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
+      try {
+        const { currencyCode = '' } = query;
+        const orderData = body as PlaceOrderRequest;
+        
+        // Validate products exist before placing order
+        const productIds = orderData.order?.items?.map(item => item.item?.productId) || [];
+        const validProducts = await Promise.all(
+          productIds.map(async (id) => {
+            try {
+              await ProductCatalogService.getProduct(id, currencyCode as string);
+              return true;
+            } catch {
+              return false;
+            }
+          })
+        );
 
-      const productList: IProductCheckoutItem[] = await Promise.all(
-        items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
-          const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+        if (validProducts.some(valid => !valid)) {
+          return res.status(400).json({ error: 'One or more products not found' });
+        }
 
-          return {
-            cost,
-            item: {
-              productId,
-              quantity,
-              product,
-            },
-          };
-        })
-      );
+        const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
 
-      return res.status(200).json({ ...order, items: productList });
+        const productList: IProductCheckoutItem[] = await Promise.all(
+          items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
+            const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+            return {
+              cost,
+              item: {
+                productId,
+                quantity,
+                product,
+              },
+            };
+          })
+        );
+
+        return res.status(200).json({ ...order, items: productList });
+      } catch (error) {
+        console.error('Checkout error:', error);
+        return res.status(500).json({ error: 'Failed to process checkout' });
+      }
     }
 
     default: {
-      return res.status(405).send('');
+      return res.status(405).send('Method not allowed');
     }
   }
 };
