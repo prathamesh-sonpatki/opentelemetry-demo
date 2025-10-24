@@ -1,0 +1,12 @@
+{
+  "flags": {
+    "productCatalogFailure": {
+      "state": "disabled",
+      "variants": {
+        "on": true,
+        "off": false
+      },
+      "defaultVariant": "off"
+    }
+  }
+}
