@@ -1,73 +1,57 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-import { ChannelCredentials, ServiceError, status } from '@grpc/grpc-js';
+import { ChannelCredentials, ServiceError } from '@grpc/grpc-js';
 import { CheckoutServiceClient, PlaceOrderRequest, PlaceOrderResponse } from '../../protos/demo';
 
-const {
-  CHECKOUT_ADDR = 'checkout-service:8080',
-  GRPC_MAX_RETRIES = '3',
-  GRPC_INITIAL_BACKOFF_MS = '1000',
-} = process.env;
+const { CHECKOUT_ADDR = 'localhost:7000', CHECKOUT_RETRY_COUNT = '3' } = process.env;
 
-const maxRetries = parseInt(GRPC_MAX_RETRIES, 10);
-const initialBackoffMs = parseInt(GRPC_INITIAL_BACKOFF_MS, 10);
+if (!CHECKOUT_ADDR) {
+  throw new Error('CHECKOUT_ADDR environment variable must be set');
+}
 
-// Create client with default address if environment variable is not set
-const client = new CheckoutServiceClient(
-  CHECKOUT_ADDR || 'checkout-service:8080',
-  ChannelCredentials.createInsecure(),
-  {
-    'grpc.enable_retries': 1,
-    'grpc.service_config': JSON.stringify({
-      methodConfig: [{
-        name: [{ service: 'CheckoutService' }],
-        retryPolicy: {
-          maxAttempts: maxRetries,
-          initialBackoff: `${initialBackoffMs}ms`,
-          maxBackoff: '5000ms',
-          backoffMultiplier: 2,
-          retryableStatusCodes: [status.UNAVAILABLE],
-        },
-      }],
-    }),
-  }
-);
+const MAX_RETRIES = parseInt(CHECKOUT_RETRY_COUNT, 10);
+const RETRY_DELAY_MS = 1000;
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const client = new CheckoutServiceClient(CHECKOUT_ADDR, ChannelCredentials.createInsecure());
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const CheckoutGateway = () => ({
   async placeOrder(order: PlaceOrderRequest) {
     let lastError: Error | null = null;
-    let attempt = 0;
-
-    while (attempt < maxRetries) {
+    
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
-        return await new Promise<PlaceOrderResponse>((resolve, reject) => {
+        return await new Promise<PlaceOrderResponse>((resolve, reject) =>
           client.placeOrder(order, (error, response) => {
             if (error) {
-              reject(error);
+              // Only retry on connection/unavailable errors
+              if (error.code === 14 || error.code === 13) {
+                reject(error);
+              } else {
+                // For other errors, fail fast
+                reject(new Error(`Checkout service error: ${error.message}`));
+              }
             } else {
               resolve(response);
             }
-          });
-        });
+          })
+        );
       } catch (error) {
         lastError = error as Error;
         
-        // Only retry on UNAVAILABLE errors
-        if ((error as ServiceError).code !== status.UNAVAILABLE) {
-          throw error;
+        // If this is the last attempt, throw the error
+        if (attempt === MAX_RETRIES - 1) {
+          throw new Error(`Failed to place order after ${MAX_RETRIES} attempts: ${lastError.message}`);
         }
-
-        attempt++;
-        if (attempt < maxRetries) {
-          await sleep(Math.min(initialBackoffMs * Math.pow(2, attempt - 1), 5000));
-        }
+        
+        // Wait before retrying
+        await delay(RETRY_DELAY_MS * (attempt + 1));
       }
     }
 
-    throw lastError || new Error('Max retries exceeded');
+    throw lastError || new Error('Unknown error occurred while placing order');
   },
 });
 
