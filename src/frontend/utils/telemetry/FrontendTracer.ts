@@ -11,6 +11,7 @@ import { browserDetector } from '@opentelemetry/opentelemetry-browser-detector';
 import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { SessionIdProcessor } from './SessionIdProcessor';
+import { fetchWithRetry, isAnalyticsUrl } from '../analytics/fetchWithRetry';
 
 const {
   NEXT_PUBLIC_OTEL_SERVICE_NAME = '',
@@ -53,6 +54,26 @@ const FrontendTracer = async () => {
     }),
   });
 
+  // Override the global fetch for analytics URLs to use retry logic
+  const originalFetch = window.fetch;
+  window.fetch = async function(input: RequestInfo, init?: RequestInit): Promise<Response> {
+    const url = typeof input === 'string' ? input : input.url;
+    
+    if (isAnalyticsUrl(url)) {
+      return fetchWithRetry(input, init, {
+        maxRetries: 3,
+        retryDelay: 1000,
+        shouldRetry: (error: Error) => {
+          // Don't retry on user abort or timeout
+          if (error.name === 'AbortError') return false;
+          return true;
+        }
+      });
+    }
+    
+    return originalFetch(input, init);
+  };
+
   registerInstrumentations({
     tracerProvider: provider,
     instrumentations: [
@@ -62,6 +83,13 @@ const FrontendTracer = async () => {
           clearTimingResources: true,
           applyCustomAttributesOnSpan(span) {
             span.setAttribute('app.synthetic_request', IS_SYNTHETIC_REQUEST);
+
+            // Add analytics-specific attributes
+            const url = span.attributes['http.url'] as string;
+            if (url && isAnalyticsUrl(url)) {
+              span.setAttribute('request.type', 'analytics');
+              span.setAttribute('analytics.retry_enabled', 'true');
+            }
           },
         },
       }),
