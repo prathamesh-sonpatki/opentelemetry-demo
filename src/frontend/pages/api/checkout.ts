@@ -8,36 +8,56 @@ import { Empty, PlaceOrderRequest } from '../../protos/demo';
 import { IProductCheckoutItem, IProductCheckout } from '../../types/Cart';
 import ProductCatalogService from '../../services/ProductCatalog.service';
 
-type TResponse = IProductCheckout | Empty;
+type TResponse = IProductCheckout | Empty | { error: string };
 
 const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
-  switch (method) {
-    case 'POST': {
-      const { currencyCode = '' } = query;
-      const orderData = body as PlaceOrderRequest;
-      const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
+  try {
+    switch (method) {
+      case 'POST': {
+        const { currencyCode = '' } = query;
+        if (!currencyCode) {
+          return res.status(400).json({ error: 'Currency code is required' });
+        }
 
-      const productList: IProductCheckoutItem[] = await Promise.all(
-        items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
-          const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+        const orderData = body as PlaceOrderRequest;
+        if (!orderData || !orderData.userId || !orderData.userCurrency || !orderData.address) {
+          return res.status(400).json({ error: 'Invalid order data' });
+        }
 
-          return {
-            cost,
-            item: {
-              productId,
-              quantity,
-              product,
-            },
-          };
-        })
-      );
+        try {
+          const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
 
-      return res.status(200).json({ ...order, items: productList });
+          const productList: IProductCheckoutItem[] = await Promise.all(
+            items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
+              const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+
+              return {
+                cost,
+                item: {
+                  productId,
+                  quantity,
+                  product,
+                },
+              };
+            })
+          );
+
+          return res.status(200).json({ ...order, items: productList });
+        } catch (error) {
+          console.error('Checkout service error:', error);
+          return res.status(503).json({
+            error: 'Unable to process checkout. Please try again later.',
+          });
+        }
+      }
+
+      default: {
+        return res.status(405).json({ error: 'Method not allowed' });
+      }
     }
-
-    default: {
-      return res.status(405).send('');
-    }
+  } catch (error) {
+    console.error('Unexpected error in checkout endpoint:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 };
 
