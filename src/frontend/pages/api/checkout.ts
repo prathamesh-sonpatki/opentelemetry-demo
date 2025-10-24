@@ -11,33 +11,55 @@ import ProductCatalogService from '../../services/ProductCatalog.service';
 type TResponse = IProductCheckout | Empty;
 
 const handler = async ({ method, body, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
-  switch (method) {
-    case 'POST': {
-      const { currencyCode = '' } = query;
-      const orderData = body as PlaceOrderRequest;
-      const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
+  try {
+    switch (method) {
+      case 'POST': {
+        const { currencyCode = '' } = query;
+        const orderData = body as PlaceOrderRequest;
 
-      const productList: IProductCheckoutItem[] = await Promise.all(
-        items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
-          const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+        // Validate input
+        if (!orderData || !orderData.order) {
+          return res.status(400).json({ error: 'Invalid order data' });
+        }
 
-          return {
-            cost,
-            item: {
-              productId,
-              quantity,
-              product,
-            },
-          };
-        })
-      );
+        // Place order with retry handling from gateway
+        const { order: { items = [], ...order } = {} } = await CheckoutGateway.placeOrder(orderData);
 
-      return res.status(200).json({ ...order, items: productList });
+        // Process products with error handling
+        const productList: IProductCheckoutItem[] = await Promise.all(
+          items.map(async ({ item: { productId = '', quantity = 0 } = {}, cost }) => {
+            try {
+              const product = await ProductCatalogService.getProduct(productId, currencyCode as string);
+              return {
+                cost,
+                item: {
+                  productId,
+                  quantity,
+                  product,
+                },
+              };
+            } catch (error) {
+              console.error(`Error fetching product ${productId}:`, error);
+              throw error; // Let the outer try/catch handle it
+            }
+          })
+        );
+
+        return res.status(200).json({ ...order, items: productList });
+      }
+
+      default: {
+        return res.status(405).send('');
+      }
     }
-
-    default: {
-      return res.status(405).send('');
-    }
+  } catch (error) {
+    console.error('Checkout API error:', error);
+    
+    // Return appropriate error response
+    const status = error.code === 'UNAVAILABLE' ? 503 : 500;
+    return res.status(status).json({
+      error: 'Checkout service temporarily unavailable. Please try again later.'
+    });
   }
 };
 
