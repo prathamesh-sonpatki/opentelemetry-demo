@@ -1,27 +1,41 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-import { ChannelCredentials } from '@grpc/grpc-js';
 import { Cart, CartItem, CartServiceClient, Empty } from '../../protos/demo';
+import { createGrpcClient, callWithRetry } from '../../utils/grpc-client-factory';
 
 const { CART_ADDR = '' } = process.env;
 
-const client = new CartServiceClient(CART_ADDR, ChannelCredentials.createInsecure());
+const client = createGrpcClient(CartServiceClient, {
+  address: CART_ADDR,
+  maxRetries: 3,
+  retryDelay: 1000,
+  timeout: 10000,
+});
 
 const CartGateway = () => ({
   getCart(userId: string) {
-    return new Promise<Cart>((resolve, reject) =>
-      client.getCart({ userId }, (error, response) => (error ? reject(error) : resolve(response)))
+    return callWithRetry<{ userId: string }, Cart>(
+      client,
+      'getCart',
+      { userId },
+      { maxRetries: 3, retryDelay: 1000 }
     );
   },
   addItem(userId: string, item: CartItem) {
-    return new Promise<Empty>((resolve, reject) =>
-      client.addItem({ userId, item }, (error, response) => (error ? reject(error) : resolve(response)))
+    return callWithRetry<{ userId: string; item: CartItem }, Empty>(
+      client,
+      'addItem',
+      { userId, item },
+      { maxRetries: 3, retryDelay: 1000 }
     );
   },
   emptyCart(userId: string) {
-    return new Promise<Empty>((resolve, reject) =>
-      client.emptyCart({ userId }, (error, response) => (error ? reject(error) : resolve(response)))
+    return callWithRetry<{ userId: string }, Empty>(
+      client,
+      'emptyCart',
+      { userId },
+      { maxRetries: 3, retryDelay: 1000 }
     );
   },
 });

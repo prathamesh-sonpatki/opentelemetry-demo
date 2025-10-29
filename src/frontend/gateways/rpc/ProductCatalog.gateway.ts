@@ -1,22 +1,33 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-import { ChannelCredentials } from '@grpc/grpc-js';
 import { ListProductsResponse, Product, ProductCatalogServiceClient } from '../../protos/demo';
+import { createGrpcClient, callWithRetry } from '../../utils/grpc-client-factory';
 
 const { PRODUCT_CATALOG_ADDR = '' } = process.env;
 
-const client = new ProductCatalogServiceClient(PRODUCT_CATALOG_ADDR, ChannelCredentials.createInsecure());
+const client = createGrpcClient(ProductCatalogServiceClient, {
+  address: PRODUCT_CATALOG_ADDR,
+  maxRetries: 3,
+  retryDelay: 1000,
+  timeout: 10000,
+});
 
 const ProductCatalogGateway = () => ({
   listProducts() {
-    return new Promise<ListProductsResponse>((resolve, reject) =>
-      client.listProducts({}, (error, response) => (error ? reject(error) : resolve(response)))
+    return callWithRetry<{}, ListProductsResponse>(
+      client,
+      'listProducts',
+      {},
+      { maxRetries: 3, retryDelay: 1000 }
     );
   },
   getProduct(id: string) {
-    return new Promise<Product>((resolve, reject) =>
-      client.getProduct({ id }, (error, response) => (error ? reject(error) : resolve(response)))
+    return callWithRetry<{ id: string }, Product>(
+      client,
+      'getProduct',
+      { id },
+      { maxRetries: 3, retryDelay: 1000 }
     );
   },
 });
