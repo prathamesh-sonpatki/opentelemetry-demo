@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -75,7 +76,14 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap in try-except to handle gRPC deadline exceptions gracefully
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Using default value: False")
+            cache_failure_enabled = False
+        
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +129,61 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling for gRPC deadline exceptions.
+    Returns False as default if the flag service is unavailable.
+    """
+    try:
+        client = api.get_client()
+        return client.get_boolean_value(flag_name, False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors including DEADLINE_EXCEEDED
+        logger.warning(f"gRPC error checking feature flag '{flag_name}': {e.code()} - {e.details()}. Using default value: False")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.warning(f"Unexpected error checking feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and exponential backoff.
+    This handles temporary connection issues with the flagd service.
+    """
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})")
+            provider = FlagdProvider(
+                host=os.environ.get('FLAGD_HOST', 'flagd'),
+                port=os.environ.get('FLAGD_PORT', 8013),
+                # Set a reasonable deadline for streaming connections (30 seconds)
+                deadline=30000
+            )
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            logger.info("FlagdProvider initialized successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                logger.error("Failed to initialize FlagdProvider after all retry attempts. Feature flags will use default values.")
+                # Set a no-op provider as fallback
+                return False
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic
+    # Service will continue even if flagd is unavailable
+    initialize_flagd_provider_with_retry()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
