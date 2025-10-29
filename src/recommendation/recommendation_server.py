@@ -121,15 +121,53 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for flagd connectivity issues.
+    Returns False (safe default) if feature flag service is unavailable.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        # Record the error in span for observability
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", str(e))
+        span.set_attribute("app.feature_flag.default_used", True)
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with increased timeout and retry settings
+    # to handle transient network issues and stream reconnections
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Initialize FlagdProvider with custom configuration
+        # - deadline: Increase RPC timeout from default 5s to 30s to handle slow networks
+        # - stream_deadline_ms: Increase EventStream timeout to handle long-running connections
+        # - keep_alive_time: Enable keep-alive to detect dead connections faster
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=30000,  # 30 second deadline for RPC calls
+            stream_deadline_ms=3600000,  # 1 hour deadline for streaming (reduced from infinite)
+            keep_alive_time=60000,  # Send keep-alive ping every 60 seconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd is not available, continue without it
+        # Feature flags will return default values
+        logger_temp = logging.getLogger('main')
+        logger_temp.warning(f"Failed to initialize flagd provider: {e}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
