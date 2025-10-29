@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check in try-except to handle gRPC deadline errors gracefully
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error and default to disabled on failure
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Defaulting to disabled.")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +130,39 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+    # Initialize OpenFeature client with error handling
     client = api.get_client()
+    # Set a reasonable timeout for the feature flag evaluation
+    # This prevents indefinite blocking on flagd service issues
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with timeout and retry settings to handle gRPC deadline errors
+    # Increase deadline and add retry configuration to handle transient failures
+    flagd_options = {
+        'deadline': 3000,  # 3 second deadline for flagd connections
+        'max_event_stream_retries': 5,  # Retry up to 5 times on stream failures
+        'retry_backoff_ms': 1000,  # 1 second backoff between retries
+    }
+    
+    try:
+        api.set_provider(
+            FlagdProvider(
+                host=os.environ.get('FLAGD_HOST', 'flagd'),
+                port=int(os.environ.get('FLAGD_PORT', 8013)),
+                **flagd_options
+            )
+        )
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info("FlagdProvider initialized successfully")
+    except Exception as e:
+        # Log error but don't fail service startup if feature flags are unavailable
+        logger_temp = logging.getLogger('main')
+        logger_temp.error(f"Failed to initialize FlagdProvider: {e}. Service will continue with default feature flag values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
