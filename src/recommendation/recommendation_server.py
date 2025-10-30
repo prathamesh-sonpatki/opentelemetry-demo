@@ -39,6 +39,9 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Initialize OpenFeature client globally to avoid repeated connection attempts
+feature_flag_client = None
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
@@ -121,15 +124,52 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with proper error handling.
+    Returns False by default if feature flag service is unavailable.
+    """
+    global feature_flag_client
+    
+    try:
+        # Use the globally initialized client
+        if feature_flag_client is None:
+            logger.warning("Feature flag client not initialized, returning default value False")
+            return False
+        
+        # Get boolean value with default fallback
+        result = feature_flag_client.get_boolean_value(flag_name, False)
+        return result
+    except Exception as e:
+        # Log the error and return default value to prevent service disruption
+        logger.warning(f"Error checking feature flag '{flag_name}': {str(e)}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize OpenFeature provider and client once at startup
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with timeout settings
+        # Note: The timeout is configured within the provider's gRPC channel
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+        ))
+        api.add_hooks([TracingHook()])
+        
+        # Get the client once and reuse it
+        feature_flag_client = api.get_client()
+        logger = logging.getLogger('main')
+        logger.info(f"OpenFeature client initialized successfully for flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # Log initialization error but don't fail service startup
+        logger = logging.getLogger('main')
+        logger.error(f"Failed to initialize OpenFeature client: {str(e)}. Feature flags will use default values.")
+        feature_flag_client = None
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
