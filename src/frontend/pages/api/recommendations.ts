@@ -13,15 +13,31 @@ const handler = async ({ method, query }: NextApiRequest, res: NextApiResponse<T
   switch (method) {
     case 'GET': {
       const { productIds = [], sessionId = '', currencyCode = '' } = query;
-      const { productIds: productList } = await RecommendationsGateway.listRecommendations(
-        sessionId as string,
-        productIds as string[]
-      );
-      const recommendedProductList = await Promise.all(
-        productList.slice(0, 4).map(id => ProductCatalogService.getProduct(id, currencyCode as string))
-      );
+      
+      try {
+        // Call recommendation service with error handling
+        const { productIds: productList } = await RecommendationsGateway.listRecommendations(
+          sessionId as string,
+          productIds as string[]
+        );
+        
+        const recommendedProductList = await Promise.all(
+          productList.slice(0, 4).map(id => ProductCatalogService.getProduct(id, currencyCode as string))
+        );
 
-      return res.status(200).json(recommendedProductList);
+        return res.status(200).json(recommendedProductList);
+      } catch (error: any) {
+        // Graceful degradation: return empty recommendations instead of 500 error
+        console.error('Failed to fetch recommendations, returning empty list', {
+          sessionId,
+          error: error.message,
+          code: error.code,
+        });
+        
+        // Return empty array to prevent frontend errors
+        // This allows the page to load without recommendations rather than crashing
+        return res.status(200).json([]);
+      }
     }
 
     default: {
