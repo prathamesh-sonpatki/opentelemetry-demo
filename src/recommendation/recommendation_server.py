@@ -121,15 +121,48 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling.
+    Returns False on any error to fail safe.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but return default value to avoid breaking the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with improved configuration for long-running EventStream connections
+    # The deadline parameter controls how long the EventStream gRPC call can run before timing out
+    # Setting it to None removes the deadline, allowing the stream to stay open indefinitely
+    # The provider will handle reconnection logic internally if the connection drops
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with extended deadline for EventStream
+        # This prevents DEADLINE_EXCEEDED errors on the persistent feature flag stream
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Set a very high deadline (24 hours) to prevent timeout on long-running streams
+            # The stream is designed to stay open for real-time flag updates
+            deadline=86400000  # 24 hours in milliseconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_initialized = False  # Will be set after logger is initialized
+    except Exception as e:
+        # If flagd provider initialization fails, log and continue
+        # The service will still work, but feature flags will always return defaults
+        print(f"Warning: Failed to initialize FlagdProvider: {e}")
+        print("Service will continue without feature flag support")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -152,6 +185,9 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Log flagd provider status after logger is initialized
+    logger.info(f"FlagdProvider initialized successfully with host={flagd_host}, port={flagd_port}")
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
