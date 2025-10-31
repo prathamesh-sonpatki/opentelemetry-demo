@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrapped in try-except to handle flagd connection issues gracefully
+        try:
+            cache_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error and default to cache disabled behavior
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Defaulting to cache disabled.")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_enabled = False
+
+        if cache_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -128,8 +137,30 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout and retry configuration to handle transient network issues
+    # This prevents DEADLINE_EXCEEDED errors when flagd is slow to respond or temporarily unavailable
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with increased timeout and keepalive settings
+        # deadline: Extended to 60 seconds to handle slow connections
+        # keepalive_time: Send keepalive pings every 30 seconds to detect connection issues
+        # This ensures graceful degradation if flagd is unavailable
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=60000,  # 60 seconds timeout for gRPC operations
+            keep_alive_time=30000,  # 30 seconds keepalive
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_provider = None  # Will be initialized after logging setup
+    except Exception as e:
+        # If flagd provider initialization fails, log error but continue service startup
+        # This ensures the recommendation service remains available even if feature flags are unavailable
+        print(f"Warning: Failed to initialize FlagdProvider: {e}. Feature flags will be disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
