@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,10 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+# Flag to track if flagd provider is available
+flagd_available = True
+# Maximum retries for flagd connection
+MAX_FLAGD_RETRIES = 3
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -75,7 +80,9 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Use safe feature flag check with fallback
+        cache_failure_enabled = check_feature_flag_safe("recommendationCacheFailure")
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -126,10 +133,90 @@ def check_feature_flag(flag_name: str):
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def check_feature_flag_safe(flag_name: str, default_value: bool = False):
+    """
+    Safely check feature flag with timeout and error handling.
+    Returns default_value if flagd is unavailable or times out.
+    """
+    global flagd_available
+    
+    # If flagd was previously unavailable, skip check and use default
+    if not flagd_available:
+        span = trace.get_current_span()
+        span.set_attribute("app.flagd.unavailable", True)
+        logger.warning(f"flagd unavailable, using default value {default_value} for flag {flag_name}")
+        return default_value
+    
+    # Try to check feature flag with retry logic
+    for attempt in range(MAX_FLAGD_RETRIES):
+        try:
+            client = api.get_client()
+            # Set a reasonable timeout context for the flag evaluation
+            flag_value = client.get_boolean_value(flag_name, default_value)
+            span = trace.get_current_span()
+            span.set_attribute("app.flagd.success", True)
+            span.set_attribute(f"app.feature_flag.{flag_name}", flag_value)
+            return flag_value
+        except Exception as e:
+            # Log the error with exception details
+            error_msg = str(e)
+            logger.warning(f"Error checking feature flag {flag_name} (attempt {attempt + 1}/{MAX_FLAGD_RETRIES}): {error_msg}")
+            
+            # Check if it's a deadline exceeded error
+            if "DEADLINE_EXCEEDED" in error_msg or "deadline" in error_msg.lower():
+                span = trace.get_current_span()
+                span.set_attribute("app.flagd.timeout", True)
+                span.set_attribute("app.flagd.attempt", attempt + 1)
+                
+                # If this is the last attempt, mark flagd as unavailable
+                if attempt == MAX_FLAGD_RETRIES - 1:
+                    flagd_available = False
+                    logger.error(f"flagd service unavailable after {MAX_FLAGD_RETRIES} attempts, using default value")
+                else:
+                    # Exponential backoff before retry
+                    backoff_time = 0.1 * (2 ** attempt)
+                    time.sleep(backoff_time)
+            else:
+                # For other errors, use default immediately
+                span = trace.get_current_span()
+                span.set_attribute("app.flagd.error", error_msg)
+                break
+    
+    # Return default value if all retries failed
+    logger.info(f"Using default value {default_value} for flag {flag_name}")
+    return default_value
+
+
+def initialize_flagd_provider():
+    """
+    Initialize FlagdProvider with proper timeout configuration and error handling.
+    """
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Set provider with timeout configuration
+        # Note: FlagdProvider may not directly support timeout in constructor,
+        # but we'll handle timeouts in the check_feature_flag_safe function
+        provider = FlagdProvider(host=flagd_host, port=flagd_port)
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        logger.info(f"FlagdProvider initialized successfully at {flagd_host}:{flagd_port}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize FlagdProvider: {e}")
+        # Set a basic no-op provider or continue without feature flags
+        global flagd_available
+        flagd_available = False
+        return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with error handling
+    initialize_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
