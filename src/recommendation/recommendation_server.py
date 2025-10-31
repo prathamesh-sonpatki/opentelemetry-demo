@@ -8,6 +8,8 @@
 import os
 import random
 from concurrent import futures
+import time
+import threading
 
 # Pip
 import grpc
@@ -121,15 +123,83 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with graceful fallback.
+    Returns False if the feature flag service is unavailable.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value
+        # This handles cases where flagd connection times out or fails
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def initialize_flagd_provider_with_retry(host: str, port: int, max_retries: int = 3, retry_delay: int = 5):
+    """
+    Initialize FlagdProvider with retry logic to handle connection failures.
+    The EventStream connection may fail initially or timeout, so we implement
+    graceful error handling to allow the service to continue operating.
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})...")
+            provider = FlagdProvider(host=host, port=port)
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            logger.info("FlagdProvider initialized successfully")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error("FlagdProvider initialization failed after all retries. Service will continue without feature flags.")
+                # Set a no-op provider to allow the service to continue
+                try:
+                    from openfeature.provider.in_memory_provider import InMemoryProvider
+                    api.set_provider(InMemoryProvider({}))
+                    logger.info("Using InMemoryProvider as fallback")
+                except:
+                    logger.warning("Could not set fallback provider")
+                return False
+    return False
+
+
+def monitor_flagd_connection():
+    """
+    Background thread to monitor and reconnect to flagd if the EventStream fails.
+    This handles the DEADLINE_EXCEEDED errors that occur when the stream times out.
+    """
+    while True:
+        try:
+            # Sleep for 60 seconds between checks
+            time.sleep(60)
+            
+            # Try to check a feature flag to verify the connection is alive
+            try:
+                client = api.get_client()
+                client.get_boolean_value("healthCheck", False)
+            except Exception as e:
+                logger.warning(f"FlagD connection check failed: {e}. Attempting to reconnect...")
+                flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+                flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+                initialize_flagd_provider_with_retry(flagd_host, flagd_port, max_retries=2, retry_delay=5)
+        except Exception as e:
+            logger.error(f"Error in flagd connection monitor: {e}")
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    initialize_flagd_provider_with_retry(flagd_host, flagd_port)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -152,6 +222,11 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+
+    # Start background thread to monitor flagd connection
+    monitor_thread = threading.Thread(target=monitor_flagd_connection, daemon=True)
+    monitor_thread.start()
+    logger.info("Started FlagD connection monitor thread")
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
