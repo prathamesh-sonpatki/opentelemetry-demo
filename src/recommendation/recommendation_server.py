@@ -121,16 +121,57 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling and fallback.
+    Returns False (default) if flagd is unavailable.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def init_flagd_provider():
+    """
+    Initialize FlagdProvider with proper timeout and retry configuration.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Set provider with custom configuration for better timeout handling
+        # The FlagdProvider will establish a streaming connection to flagd
+        # If flagd is unavailable, the provider will still initialize but feature flags
+        # will return their default values
+        logger.info(f"Initializing FlagdProvider: host={flagd_host}, port={flagd_port}")
+        
+        # Create provider with timeout configuration
+        # Note: The FlagdProvider itself handles reconnection logic internally
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # The deadline parameter sets the gRPC deadline for EventStream
+            # Default is 600 seconds, we're setting it to 300 seconds (5 minutes)
+            # to avoid very long-lived connections that can timeout
+            deadline=300000  # 300 seconds in milliseconds
+        )
+        
+        api.set_provider(provider)
+        logger.info("FlagdProvider initialized successfully")
+        
+    except Exception as e:
+        # Log error but continue - feature flags will return default values
+        logger.error(f"Failed to initialize FlagdProvider: {e}. Feature flags will use default values.")
+        # Don't re-raise - allow service to continue without feature flags
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
+    
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
@@ -152,6 +193,10 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+
+    # Initialize FlagdProvider with proper error handling
+    init_flagd_provider()
+    api.add_hooks([TracingHook()])
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
