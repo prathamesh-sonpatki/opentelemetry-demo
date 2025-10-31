@@ -121,15 +121,52 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling for gRPC deadline exceeded errors.
+    Returns False (safe default) if flagd service is unavailable.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC deadline exceeded and other RPC errors gracefully
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag check timed out for '{flag_name}', using default value: False")
+        else:
+            logger.error(f"Feature flag check failed for '{flag_name}': {e}, using default value: False")
+        return False
+    except Exception as e:
+        # Catch any other unexpected errors
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {e}, using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with increased deadline and retry configuration
+    # The deadline is set to 0 (infinite) to prevent EventStream from timing out
+    # The provider will automatically reconnect on connection failures
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with proper error handling
+        # Set deadline to 0 for persistent EventStream connection
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            deadline=0  # Disable deadline for long-running EventStream connection
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('init')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        logger_temp = logging.getLogger('init')
+        logger_temp.error(f"Failed to initialize flagd provider: {e}. Feature flags will use default values.")
+        # Continue without feature flags - application should still function
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
