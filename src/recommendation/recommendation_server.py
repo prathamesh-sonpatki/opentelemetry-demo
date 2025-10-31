@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,78 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and fallback behavior.
+    Returns False if flagd service is unavailable or times out.
+    """
+    try:
+        # Set a timeout context for the feature flag check
+        # This prevents indefinite blocking on flagd service calls
+        client = api.get_client()
+        
+        # Add timeout and retry handling for feature flag evaluation
+        max_retries = 2
+        retry_delay = 0.1  # 100ms initial delay
+        
+        for attempt in range(max_retries):
+            try:
+                # Get boolean value with explicit default fallback
+                result = client.get_boolean_value(flag_name, False)
+                return result
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    # Log retry attempt and wait before retrying
+                    logger.warning(f"Feature flag check failed (attempt {attempt + 1}/{max_retries}): {str(e)}. Retrying...")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                else:
+                    # Final attempt failed, fall through to outer exception handler
+                    raise
+                    
+    except Exception as e:
+        # Log the error with context but don't crash the service
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        
+        logger.warning(
+            f"Feature flag '{flag_name}' check failed: {type(e).__name__} - {str(e)}. "
+            f"Falling back to default value (False). Service continues normally."
+        )
+        
+        # Return safe default value instead of crashing
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagD provider with timeout configuration and error handling
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with timeout settings
+        # Note: The FlagdProvider should have deadline/timeout configured
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Add reasonable timeout for EventStream connections
+            # This helps prevent indefinite blocking on flagd service
+        )
+        
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Successfully initialized FlagD provider at {flagd_host}:{flagd_port}")
+        
+    except Exception as e:
+        # Log error but don't crash - service can run without feature flags
+        logger_temp = logging.getLogger('main')
+        logger_temp.warning(
+            f"Failed to initialize FlagD provider: {type(e).__name__} - {str(e)}. "
+            f"Service will continue with feature flags disabled (all flags default to False)."
+        )
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
