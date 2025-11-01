@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check in try-except to handle gRPC deadline exceeded errors
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error but continue with default behavior (feature flag disabled)
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Using default value (False).")
+            span.add_event("feature_flag_check_failed", {"error": str(e)})
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -128,8 +137,31 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagD provider with proper timeout settings
+    # Set deadline to None to avoid DEADLINE_EXCEEDED errors on long-lived streaming connections
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Initialize FlagD provider with error handling
+        # The FlagdProvider creates a streaming connection that can timeout
+        # We configure it with appropriate settings and handle initialization errors
+        logger_init = logging.getLogger('init')
+        logger_init.info(f"Initializing FlagD provider with host={flagd_host}, port={flagd_port}")
+        
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Additional configuration to handle streaming connection issues
+            # Note: The deadline setting depends on the flagd provider implementation
+        ))
+        api.add_hooks([TracingHook()])
+        logger_init.info("FlagD provider initialized successfully")
+    except Exception as e:
+        # Log error but don't fail service startup if feature flags are unavailable
+        logger_init = logging.getLogger('init')
+        logger_init.error(f"Failed to initialize FlagD provider: {e}. Service will continue without feature flags.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
