@@ -128,7 +128,22 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with extended deadline for EventStream
+    # The EventStream is a long-running gRPC streaming connection that should not timeout
+    # Setting deadline to None or a very high value prevents DEADLINE_EXCEEDED errors
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Configure FlagdProvider with retry options and extended deadline
+    # Note: The underlying gRPC channel will handle reconnection automatically
+    api.set_provider(FlagdProvider(
+        host=flagd_host,
+        port=flagd_port,
+        # The deadline parameter controls timeout for gRPC calls
+        # For streaming EventStream connections, we need a very long timeout
+        deadline=3600000  # 1 hour in milliseconds (increase if needed)
+    ))
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
@@ -152,6 +167,8 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    logger.info(f'Initializing FlagdProvider with host={flagd_host}, port={flagd_port}, deadline=3600000ms')
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
