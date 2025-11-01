@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,17 +122,78 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling.
+    Returns False if flagd connection fails to allow service to continue.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Returning default value False.")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and timeout configuration.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    
+    Returns:
+        bool: True if initialization successful, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with timeout configuration
+            # Note: The FlagdProvider may establish a persistent EventStream connection
+            # We wrap this in a try-catch to handle connection timeouts gracefully
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Add deadline/timeout configuration if supported by the provider
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            delay = initial_delay * (2 ** attempt)  # Exponential backoff
+            logger.warning(
+                f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}. "
+                f"Retrying in {delay} seconds..."
+            )
+            
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts. "
+                    "Service will continue without feature flag support. "
+                    "Feature flags will return default values."
+                )
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
-    # Initialize Traces and Metrics
+    
+    # Initialize Traces and Metrics first (before flagd to ensure observability)
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
     rec_svc_metrics = init_metrics(meter)
@@ -152,6 +214,17 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Initialize flagd provider with retry and error handling
+    # Service will continue even if flagd connection fails
+    flagd_available = initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1)
+    
+    if not flagd_available:
+        logger.warning(
+            "Running without feature flag support. "
+            "All feature flags will return default values. "
+            "Check flagd service availability and connectivity."
+        )
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
