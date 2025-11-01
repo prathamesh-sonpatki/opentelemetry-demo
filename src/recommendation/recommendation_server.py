@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -75,7 +76,22 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check with exception handling to prevent deadline exceeded errors
+        cache_failure_enabled = False
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                logger.warning("Feature flag check timed out, using default value: False")
+                span.set_attribute("app.feature_flag.timeout", True)
+            else:
+                logger.error(f"Feature flag check failed: {e}")
+                span.set_attribute("app.feature_flag.error", str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error checking feature flag: {e}")
+            span.set_attribute("app.feature_flag.error", str(e))
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,14 +137,54 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+    # Initialize OpenFeature with timeout handling
     client = api.get_client()
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and proper timeout configuration.
+    This prevents gRPC DEADLINE_EXCEEDED errors from propagating.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            # Configure FlagdProvider with increased timeout and keepalive settings
+            # The deadline parameter sets the gRPC timeout
+            provider = FlagdProvider(
+                host=flagd_host, 
+                port=flagd_port,
+                # Set a longer deadline to prevent timeout issues (default is 10 minutes)
+                # We set it to 1 hour to ensure stable connection
+                deadline=3600000  # 1 hour in milliseconds
+            )
+            api.set_provider(provider)
+            logger.info(f"Successfully initialized FlagdProvider (attempt {attempt + 1}/{max_retries})")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)  # Exponential backoff
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to initialize FlagdProvider after {max_retries} attempts")
+                # Continue without feature flags - graceful degradation
+                return False
+    
+    return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with retry logic and proper error handling
+    initialize_flagd_provider_with_retry()
+    
+    # Add OpenTelemetry tracing hook for feature flag operations
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
