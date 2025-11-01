@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_provider_available = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +123,88 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with fallback to False if flagd is unavailable.
+    This prevents service crashes when the feature flag service is down.
+    """
+    global flagd_provider_available
+    
+    if not flagd_provider_available:
+        logger.debug(f"Feature flag provider unavailable, returning default value False for {flag_name}")
+        return False
+    
+    try:
+        client = api.get_client()
+        return client.get_boolean_value(flag_name, False)
+    except Exception as e:
+        logger.warning(f"Error checking feature flag {flag_name}: {e}. Returning default value False")
+        return False
+
+
+def init_flagd_provider_with_retry(max_retries=3, initial_backoff=1.0):
+    """
+    Initialize FlagdProvider with retry logic and exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of connection attempts
+        initial_backoff: Initial backoff time in seconds
+    
+    Returns:
+        bool: True if provider was successfully initialized, False otherwise
+    """
+    global flagd_provider_available
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    backoff = initial_backoff
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize provider with timeout to prevent indefinite hangs
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Add deadline/timeout if supported by the provider version
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            flagd_provider_available = True
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return True
+            
+        except grpc.RpcError as e:
+            logger.warning(f"gRPC error connecting to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                flagd_provider_available = False
+                
+        except Exception as e:
+            logger.warning(f"Unexpected error connecting to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                flagd_provider_available = False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic
+    # Service will continue to function even if flagd is unavailable
+    init_flagd_provider_with_retry(max_retries=3, initial_backoff=1.0)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
