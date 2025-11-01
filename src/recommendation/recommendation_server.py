@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -75,23 +76,32 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
-            span.set_attribute("app.recommendation.cache_enabled", True)
-            if random.random() < 0.5 or first_run:
-                first_run = False
-                span.set_attribute("app.cache_hit", False)
-                logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+        # Added try-catch to handle flagd timeout errors gracefully
+        try:
+            if check_feature_flag("recommendationCacheFailure"):
+                span.set_attribute("app.recommendation.cache_enabled", True)
+                if random.random() < 0.5 or first_run:
+                    first_run = False
+                    span.set_attribute("app.cache_hit", False)
+                    logger.info("get_product_list: cache miss")
+                    cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+                    response_ids = [x.id for x in cat_response.products]
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                else:
+                    span.set_attribute("app.cache_hit", True)
+                    logger.info("get_product_list: cache hit")
+                    product_ids = cached_ids
             else:
-                span.set_attribute("app.cache_hit", True)
-                logger.info("get_product_list: cache hit")
-                product_ids = cached_ids
-        else:
+                span.set_attribute("app.recommendation.cache_enabled", False)
+                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+                product_ids = [x.id for x in cat_response.products]
+        except Exception as e:
+            # If feature flag service is unavailable, fall back to default behavior
+            logger.warning(f"Feature flag check failed, falling back to default behavior: {e}")
             span.set_attribute("app.recommendation.cache_enabled", False)
+            span.set_attribute("app.feature_flag.error", str(e))
             cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
             product_ids = [x.id for x in cat_response.products]
 
@@ -126,10 +136,59 @@ def check_feature_flag(flag_name: str):
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def initialize_flagd_provider_with_retry(max_retries=3, retry_delay=2):
+    """
+    Initialize FlagdProvider with retry logic to handle connection failures.
+    
+    Args:
+        max_retries: Maximum number of connection attempts
+        retry_delay: Delay in seconds between retry attempts
+        
+    Returns:
+        bool: True if provider was set successfully, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure FlagdProvider with connection timeout
+            provider = FlagdProvider(
+                host=flagd_host, 
+                port=flagd_port,
+                # Note: connection timeout depends on flagd provider implementation
+                # This may require additional configuration in future versions
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                return False
+    
+    return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic and graceful failure handling
+    flagd_initialized = initialize_flagd_provider_with_retry(max_retries=3, retry_delay=2)
+    
+    if not flagd_initialized:
+        logger.warning("Feature flag service is unavailable. Service will continue with feature flags disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
