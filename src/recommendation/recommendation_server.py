@@ -121,15 +121,45 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with proper error handling.
+    Returns False if flagd service is unavailable to prevent service disruption.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't fail the service - return default value
+        logger.warning(f"Failed to fetch feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with custom configuration for better timeout handling
+    # The EventStream gRPC call will automatically reconnect on failures
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with connection details
+        # Note: The FlagdProvider internally manages stream reconnection
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Keep alive settings to prevent long-lived connections from timing out
+            keep_alive_time=300000,  # 5 minutes in milliseconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger(__name__)
+        logger_temp.info(f"Successfully initialized FlagdProvider with host={flagd_host}, port={flagd_port}")
+    except Exception as e:
+        # If flagd initialization fails, log but continue - feature flags will return defaults
+        logger_temp = logging.getLogger(__name__)
+        logger_temp.warning(f"Failed to initialize FlagdProvider: {e}. Service will continue with default feature flag values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
