@@ -128,7 +128,24 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Configure FlagdProvider with increased deadline for long-running EventStream connection
+    # The EventStream is designed to stay open for real-time flag updates
+    # Set deadline to None (infinite) to prevent DEADLINE_EXCEEDED errors
+    # Alternative: Set a very long deadline like 86400 seconds (24 hours)
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Initialize FlagdProvider with custom configuration to handle long-running streams
+    # The deadline parameter controls how long gRPC calls can run
+    # For EventStream (a server-streaming RPC), we need an extended or infinite deadline
+    api.set_provider(FlagdProvider(
+        host=flagd_host, 
+        port=flagd_port,
+        # Set deadline to None for infinite timeout on streaming connections
+        # This prevents DEADLINE_EXCEEDED exceptions on the EventStream
+        deadline=None
+    ))
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
