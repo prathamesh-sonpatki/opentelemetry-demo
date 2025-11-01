@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Added error handling to gracefully handle feature flag service failures
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error and continue with default behavior (cache disabled)
+            logger.warning(f"Failed to fetch feature flag 'recommendationCacheFailure': {e}. Defaulting to cache disabled.")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_failure_enabled = False
+        
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +130,77 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with improved error handling for connection issues.
+    Returns False if the feature flag service is unavailable.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        logger.error(f"gRPC error while fetching feature flag '{flag_name}': {e.code()} - {e.details()}")
+        raise
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.error(f"Unexpected error while fetching feature flag '{flag_name}': {e}")
+        raise
+
+
+def initialize_feature_flags():
+    """
+    Initialize feature flag provider with retry logic and proper timeout configuration.
+    """
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            # Initialize FlagdProvider with connection parameters
+            flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+            flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+            
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {retry_count + 1}/{max_retries})")
+            
+            # Set up the provider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host, 
+                port=flagd_port,
+                # Note: timeout and deadline configuration depends on the specific version
+                # of openfeature-provider-flagd. Adjust as needed for your version.
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info("Successfully initialized feature flag provider")
+            return True
+            
+        except Exception as e:
+            retry_count += 1
+            logger.warning(f"Failed to initialize feature flag provider (attempt {retry_count}/{max_retries}): {e}")
+            
+            if retry_count >= max_retries:
+                logger.error(f"Failed to initialize feature flag provider after {max_retries} attempts. Service will continue with feature flags disabled.")
+                # Don't fail the entire service, just log the error
+                return False
+            
+            # Wait before retrying (exponential backoff)
+            import time
+            time.sleep(2 ** retry_count)
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flags with proper error handling
+    feature_flags_available = initialize_feature_flags()
+    
+    if not feature_flags_available:
+        logger.warning("Service starting without feature flag support due to initialization failure")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
