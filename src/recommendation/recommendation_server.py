@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,8 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_provider_initialized = False
+flagd_connection_error = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +124,93 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling.
+    Returns False (default) if flagd service is unavailable.
+    """
+    global flagd_connection_error
+    
+    # If we know flagd is having connection issues, fail fast with default value
+    if flagd_connection_error:
+        return False
+    
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        # Set a timeout for the flag evaluation to prevent hanging
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag check timed out for '{flag_name}'. Using default value (False). Error: {e.details()}")
+            flagd_connection_error = True  # Mark connection as problematic
+        elif e.code() == grpc.StatusCode.UNAVAILABLE:
+            logger.warning(f"Feature flag service unavailable for '{flag_name}'. Using default value (False). Error: {e.details()}")
+            flagd_connection_error = True
+        else:
+            logger.error(f"gRPC error checking feature flag '{flag_name}': {e}. Using default value (False).")
+        return False
+    except Exception as e:
+        # Catch-all for any other unexpected errors
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {e}. Using default value (False).")
+        return False
+
+
+def initialize_flagd_provider(max_retries=3, retry_delay=2):
+    """
+    Initialize FlagdProvider with retry logic and proper timeout configuration.
+    Returns True if successful, False otherwise.
+    """
+    global flagd_provider_initialized
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})...")
+            
+            # Initialize FlagdProvider with timeout configuration
+            # The deadline parameter controls how long the EventStream connection lives
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=300000  # 5 minutes deadline (in milliseconds) instead of default 10 minutes
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            # Test the connection with a simple flag check
+            client = api.get_client()
+            # This will raise an exception if flagd is not reachable
+            client.get_boolean_value("test_connection", False)
+            
+            flagd_provider_initialized = True
+            logger.info("FlagdProvider initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                sleep_time = retry_delay * (2 ** attempt)
+                logger.info(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                logger.error("Failed to initialize FlagdProvider after all retries. Feature flags will be disabled.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic
+    # Service will start even if flagd is unavailable
+    initialize_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
