@@ -121,15 +121,42 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature client with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log error and return default value if flag service is unavailable
+        logger.error(f"Failed to get feature flag '{flag_name}': {e}")
+        # Return False as safe default when flag service is unavailable
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with improved configuration
+    # Set deadline and retry configuration to handle connection issues
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    
+    try:
+        # Initialize the FlagdProvider with timeout/deadline configuration
+        # The deadline parameter helps prevent indefinite blocking on streaming connections
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=30000  # 30 seconds deadline for gRPC calls (in milliseconds)
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd is unavailable, log error and continue without feature flags
+        # This prevents the entire service from failing if flagd is down
+        logger_temp = logging.getLogger('main')
+        logger_temp.error(f"Failed to initialize flagd provider: {e}. Service will continue without feature flags.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
