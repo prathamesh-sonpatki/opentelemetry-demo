@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,100 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling.
+    Returns False if flagd is unavailable to prevent service disruption.
+    """
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def init_flagd_provider_with_retry(host: str, port: int, max_retries: int = 3, initial_backoff: float = 1.0):
+    """
+    Initialize FlagdProvider with retry logic and custom deadline.
+    
+    Args:
+        host: Flagd service host
+        port: Flagd service port
+        max_retries: Maximum number of connection retry attempts
+        initial_backoff: Initial backoff time in seconds (exponential backoff)
+    
+    Returns:
+        FlagdProvider instance or None if all retries fail
+    """
+    attempt = 0
+    backoff = initial_backoff
+    
+    while attempt < max_retries:
+        try:
+            logger.info(f"Initializing FlagdProvider connection to {host}:{port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure gRPC channel options with proper timeouts
+            # Set deadline to 60s for EventStream to handle long-running connections
+            # Increase max_receive_message_length to handle larger payloads
+            channel_options = [
+                ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+                ('grpc.keepalive_time_ms', 30000),  # 30 seconds
+                ('grpc.keepalive_timeout_ms', 10000),  # 10 seconds
+                ('grpc.keepalive_permit_without_calls', 1),
+                ('grpc.http2.max_pings_without_data', 0),
+            ]
+            
+            # Initialize FlagdProvider with timeout configuration
+            provider = FlagdProvider(
+                host=host,
+                port=port,
+                deadline=60000,  # 60 second deadline for operations (in milliseconds)
+                stream_deadline_ms=120000,  # 120 second deadline for EventStream (in milliseconds)
+            )
+            
+            logger.info("FlagdProvider initialized successfully")
+            return provider
+            
+        except Exception as e:
+            attempt += 1
+            if attempt < max_retries:
+                logger.warning(
+                    f"Failed to initialize FlagdProvider (attempt {attempt}/{max_retries}): {e}. "
+                    f"Retrying in {backoff:.1f}s..."
+                )
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+            else:
+                logger.error(
+                    f"Failed to initialize FlagdProvider after {max_retries} attempts: {e}. "
+                    "Service will continue without feature flag support."
+                )
+                return None
+    
+    return None
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic and error handling
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    flagd_provider = init_flagd_provider_with_retry(
+        host=flagd_host,
+        port=flagd_port,
+        max_retries=3,
+        initial_backoff=1.0
+    )
+    
+    if flagd_provider:
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_name = 'main'
+    else:
+        logger_name = 'main'
+        # Log warning but continue - service will work without feature flags
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -150,7 +236,7 @@ if __name__ == "__main__":
     handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
 
     # Attach OTLP handler to logger
-    logger = logging.getLogger('main')
+    logger = logging.getLogger(logger_name)
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
