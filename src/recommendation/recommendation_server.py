@@ -123,12 +123,38 @@ def must_map_env(key: str):
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Add error handling for feature flag evaluation
+    # to prevent gRPC deadline timeouts from propagating
+    try:
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value
+        logger.warning(f"Feature flag evaluation failed: {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with increased timeout and retry settings
+    # This prevents gRPC DEADLINE_EXCEEDED errors on the EventStream connection
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Configure FlagdProvider with timeout and connection settings
+    # The deadline parameter controls how long the EventStream can remain open
+    # Default is 600s (10 minutes) which can cause timeout exceptions
+    flagd_provider = FlagdProvider(
+        host=flagd_host, 
+        port=flagd_port,
+        # Set a longer deadline for the streaming connection (1 hour)
+        # This reduces the frequency of deadline exceeded exceptions
+        deadline=3600,
+        # Enable keep-alive to maintain connection health
+        keep_alive_time=60,
+    )
+    
+    api.set_provider(flagd_provider)
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
