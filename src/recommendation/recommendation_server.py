@@ -123,13 +123,39 @@ def must_map_env(key: str):
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    try:
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Graceful degradation: return default value if feature flag service is unavailable
+        logger.warning(f"Failed to get feature flag '{flag_name}': {e}")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with proper settings to avoid DEADLINE_EXCEEDED errors
+    # The EventStream is a long-running gRPC connection that should not timeout
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Initialize FlagdProvider with deadline=0 to disable timeout for streaming connections
+        # This prevents DEADLINE_EXCEEDED errors on the long-running EventStream
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=0,  # Disable deadline for long-running streams
+            retry_backoff_max_ms=60000,  # Max 60 seconds between retries
+        )
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Successfully connected to flagd service at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # Log error but continue - service can operate without feature flags
+        logger_temp = logging.getLogger('main')
+        logger_temp.error(f"Failed to initialize FlagdProvider: {e}. Feature flags will be disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
