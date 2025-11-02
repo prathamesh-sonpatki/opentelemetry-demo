@@ -121,15 +121,43 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value if feature flag service is unavailable
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout and retry configuration
+    # Added deadline configuration to prevent DEADLINE_EXCEEDED errors
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with timeout settings
+        # The deadline parameter helps prevent long-running connections from timing out
+        provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Set reasonable timeout for gRPC connections (30 seconds)
+            # This prevents DEADLINE_EXCEEDED errors on slow networks
+            deadline=30000  # milliseconds
+        )
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        logger_initialized = False  # Track if logger is initialized
+        
+    except Exception as e:
+        # If FlagdProvider initialization fails, log error and continue
+        # This ensures the service can still operate even if feature flags are unavailable
+        print(f"Warning: Failed to initialize FlagdProvider: {e}")
+        print("Service will continue without feature flag support")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
