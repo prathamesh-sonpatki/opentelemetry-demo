@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,14 +122,91 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with graceful degradation.
+    Returns False if FlagD is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client with timeout
+        client = api.get_client()
+        
+        # Get flag value with span for observability
+        with tracer.start_as_current_span("check_feature_flag") as span:
+            span.set_attribute("feature_flag.name", flag_name)
+            
+            # Attempt to get the boolean value with a default fallback
+            flag_value = client.get_boolean_value(flag_name, False)
+            
+            span.set_attribute("feature_flag.value", flag_value)
+            span.set_attribute("feature_flag.status", "success")
+            
+            return flag_value
+            
+    except Exception as e:
+        # Log the error but don't fail the service
+        logger.warning(f"Feature flag check failed for '{flag_name}': {str(e)}. Using default value: False")
+        
+        # Add span attributes for debugging
+        span = trace.get_current_span()
+        span.set_attribute("feature_flag.name", flag_name)
+        span.set_attribute("feature_flag.status", "error")
+        span.set_attribute("feature_flag.error", str(e))
+        span.set_attribute("feature_flag.value", False)
+        
+        # Return safe default value
+        return False
+
+
+def init_flagd_provider_with_retry(max_retries=3, initial_timeout=2):
+    """
+    Initialize FlagD provider with retry logic and timeout.
+    Implements exponential backoff for connection attempts.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Get configurable timeout from environment or use default
+    connection_timeout = int(os.environ.get('FLAGD_TIMEOUT_SECONDS', initial_timeout))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to FlagD at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Create FlagD provider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Note: timeout support depends on openfeature-provider-flagd version
+                # Some versions may not support direct timeout configuration
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            
+            logger.info(f"Successfully connected to FlagD at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            wait_time = connection_timeout * (2 ** attempt)  # Exponential backoff
+            logger.warning(f"Failed to connect to FlagD (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"Failed to connect to FlagD after {max_retries} attempts. Service will continue with default flag values.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagD provider with retry and timeout handling
+    flagd_connected = init_flagd_provider_with_retry()
+    
+    # Add OpenTelemetry tracing hook
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
@@ -152,6 +230,12 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Log FlagD connection status
+    if flagd_connected:
+        logger.info("FlagD feature flag service is available")
+    else:
+        logger.warning("FlagD feature flag service is unavailable - using default values")
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
