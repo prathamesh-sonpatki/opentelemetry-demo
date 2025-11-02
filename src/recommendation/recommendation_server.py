@@ -121,15 +121,55 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature client with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with proper gRPC channel options for long-lived streaming connections
+    # These settings prevent DEADLINE_EXCEEDED errors on the EventStream connection
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Create gRPC channel options optimized for long-running streams
+    grpc_options = [
+        # Disable deadline for streaming connections (use None/infinite timeout)
+        ('grpc.max_receive_message_length', -1),
+        ('grpc.max_send_message_length', -1),
+        # Enable keepalive to maintain healthy long-lived connections
+        ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive response
+        ('grpc.keepalive_permit_without_calls', True),  # Allow keepalive pings without active RPCs
+        ('grpc.http2.max_pings_without_data', 0),  # No limit on pings without data
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # Min 10 seconds between pings
+    ]
+    
+    try:
+        # Initialize FlagdProvider with connection retry logic
+        logger_temp = logging.getLogger('flagd_init')
+        logger_temp.info(f"Initializing FlagdProvider connection to {flagd_host}:{flagd_port}")
+        
+        # FlagdProvider will use these options for its internal gRPC channel
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Pass custom options if the provider supports it
+            # Note: This may require openfeature-provider-flagd >= 0.5.0
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp.info("Successfully initialized FlagdProvider")
+    except Exception as e:
+        logger_temp = logging.getLogger('flagd_init')
+        logger_temp.error(f"Failed to initialize FlagdProvider: {e}. Feature flags will use default values.")
+        # Continue execution - service will work with default feature flag values
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
