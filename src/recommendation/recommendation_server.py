@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,14 +122,80 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for deadline exceeded errors.
+    Returns False if flagd is unavailable to allow graceful degradation.
+    """
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value to prevent service disruption
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def init_flagd_provider_with_retry(host: str, port: int, max_retries: int = 3, initial_backoff: float = 1.0):
+    """
+    Initialize FlagdProvider with exponential backoff retry logic.
+    
+    Args:
+        host: FlagD host address
+        port: FlagD port number
+        max_retries: Maximum number of connection attempts
+        initial_backoff: Initial backoff delay in seconds
+    
+    Returns:
+        True if provider was successfully initialized, False otherwise
+    """
+    backoff = initial_backoff
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagD provider (attempt {attempt + 1}/{max_retries})...")
+            
+            # Configure FlagdProvider with keepalive settings to handle long-running connections
+            # The default deadline of 600s (10 minutes) causes DEADLINE_EXCEEDED errors
+            provider = FlagdProvider(
+                host=host,
+                port=port,
+                # Note: The current version of openfeature-provider-flagd may not support
+                # these parameters directly. This is a proposed fix that may require
+                # updating the library or wrapping the provider with custom retry logic.
+            )
+            
+            api.set_provider(provider)
+            logger.info("FlagD provider initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagD provider (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                backoff *= 2  # Exponential backoff
+            else:
+                logger.error("Max retries reached. FlagD provider initialization failed. Feature flags will use default values.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagD provider with retry logic and error handling
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    
+    # Attempt to initialize the provider with retries
+    flagd_initialized = init_flagd_provider_with_retry(flagd_host, flagd_port)
+    
+    if not flagd_initialized:
+        logger.warning("Service starting without FlagD connection. Feature flags will use default values.")
+    
+    # Add OpenTelemetry tracing hook for feature flag operations
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
