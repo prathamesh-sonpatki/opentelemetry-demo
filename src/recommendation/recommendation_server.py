@@ -122,14 +122,44 @@ def must_map_env(key: str):
 
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log warning but don't crash if feature flag service is unavailable
+        logger.warn(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize OpenFeature with flagd provider and increased timeout/retry configuration
+    # to handle transient connection issues
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with connection retry and timeout settings
+        # This prevents DEADLINE_EXCEEDED errors during startup or transient network issues
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=30000,  # 30 second deadline for gRPC calls (default is 10s)
+            stream_deadline_ms=600000,  # 10 minute deadline for EventStream (default causes timeouts)
+            keep_alive=True,
+            retry_grace_period=15,  # Wait 15 seconds before retrying failed connections
+            max_event_stream_retries=5  # Retry stream connection up to 5 times
+        )
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd connection fails, log error but continue running
+        # Feature flags will return default values
+        logger_temp = logging.getLogger('main')
+        logger_temp.error(f"Failed to initialize flagd provider: {e}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
