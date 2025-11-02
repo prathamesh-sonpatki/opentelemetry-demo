@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -75,7 +76,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Added error handling for feature flag service failures
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error and fall back to default behavior
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Using default value: False")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -120,16 +130,93 @@ def must_map_env(key: str):
     return value
 
 
-def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+def check_feature_flag(flag_name: str, default_value: bool = False, max_retries: int = 3):
+    """
+    Check feature flag with retry logic and graceful degradation.
+    
+    Args:
+        flag_name: Name of the feature flag to check
+        default_value: Default value to return if flag check fails
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        Boolean value of the feature flag, or default_value on failure
+    """
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    
+    for attempt in range(max_retries):
+        try:
+            return client.get_boolean_value(flag_name, default_value)
+        except grpc.RpcError as e:
+            # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+            if attempt < max_retries - 1:
+                backoff_time = min(2 ** attempt, 10)  # Exponential backoff, max 10 seconds
+                logger.warning(
+                    f"gRPC error checking feature flag '{flag_name}' (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {backoff_time}s..."
+                )
+                time.sleep(backoff_time)
+            else:
+                logger.error(
+                    f"Failed to check feature flag '{flag_name}' after {max_retries} attempts: {e}. "
+                    f"Returning default value: {default_value}"
+                )
+                return default_value
+        except Exception as e:
+            # Handle any other unexpected errors
+            logger.error(
+                f"Unexpected error checking feature flag '{flag_name}': {e}. "
+                f"Returning default value: {default_value}"
+            )
+            return default_value
+    
+    return default_value
+
+
+def init_flagd_provider_with_retry(max_retries: int = 3):
+    """
+    Initialize the flagd provider with retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to initialize flagd provider (attempt {attempt + 1}/{max_retries})")
+            provider = FlagdProvider(host=flagd_host, port=flagd_port)
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            logger.info(f"Successfully initialized flagd provider at {flagd_host}:{flagd_port}")
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                backoff_time = min(2 ** attempt, 10)
+                logger.warning(
+                    f"Failed to initialize flagd provider (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {backoff_time}s..."
+                )
+                time.sleep(backoff_time)
+            else:
+                logger.error(
+                    f"Failed to initialize flagd provider after {max_retries} attempts: {e}. "
+                    f"Feature flags will use default values."
+                )
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with retry logic and error handling
+    init_flagd_provider_with_retry()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
