@@ -9,26 +9,55 @@ const defaultCurrencyCode = 'USD';
 
 const ProductCatalogService = () => ({
   async getProductPrice(price: Money, currencyCode: string) {
-    return !!currencyCode && currencyCode !== defaultCurrencyCode
-      ? await CurrencyGateway.convert(price, currencyCode)
-      : price;
+    // Add null safety check
+    if (!price) {
+      console.warn('Price is null or undefined, returning default');
+      return { currencyCode: defaultCurrencyCode, units: 0, nanos: 0 };
+    }
+    
+    try {
+      return !!currencyCode && currencyCode !== defaultCurrencyCode
+        ? await CurrencyGateway.convert(price, currencyCode)
+        : price;
+    } catch (error) {
+      console.error('Currency conversion failed, returning original price:', error);
+      return price; // Fallback to original price
+    }
   },
   async listProducts(currencyCode = 'USD') {
     const { products: productList } = await ProductCatalogGateway.listProducts();
 
+    if (!productList || productList.length === 0) {
+      console.warn('No products returned from ProductCatalog');
+      return [];
+    }
+
     return Promise.all(
       productList.map(async product => {
-        const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
-
-        return {
-          ...product,
-          priceUsd,
-        };
+        try {
+          const priceUsd = await this.getProductPrice(product.priceUsd!, currencyCode);
+          return {
+            ...product,
+            priceUsd,
+          };
+        } catch (error) {
+          console.error(`Failed to process product ${product.id}:`, error);
+          // Return product with original price on error
+          return product;
+        }
       })
     );
   },
   async getProduct(id: string, currencyCode = 'USD') {
+    if (!id) {
+      throw new Error('Product ID is required');
+    }
+    
     const product = await ProductCatalogGateway.getProduct(id);
+    
+    if (!product) {
+      throw new Error(`Product not found: ${id}`);
+    }
 
     return {
       ...product,
