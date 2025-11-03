@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,8 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+# Flag to track if feature flags are available
+feature_flags_available = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +124,80 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check if a feature flag is enabled with graceful degradation.
+    Returns False if feature flag service is unavailable.
+    """
+    global feature_flags_available
+    
+    if not feature_flags_available:
+        # Feature flags are not available, return default
+        return False
+    
+    try:
+        # Initialize OpenFeature client with timeout
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't fail the service
+        logger.warning(f"Failed to get feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def init_feature_flags_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize feature flags provider with retry logic and exponential backoff.
+    Returns True if successful, False otherwise.
+    """
+    global feature_flags_available
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Create provider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=5000  # 5 second timeout
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            # Test the connection by trying to get a simple flag
+            client = api.get_client()
+            _ = client.get_boolean_value("test_connection", False)
+            
+            logger.info("Successfully connected to flagd service")
+            feature_flags_available = True
+            return True
+            
+        except Exception as e:
+            delay = initial_delay * (2 ** attempt)  # Exponential backoff
+            logger.warning(f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                feature_flags_available = False
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flags with error handling
+    # Service will continue even if flagd is unavailable
+    init_feature_flags_with_retry()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -170,4 +238,10 @@ if __name__ == "__main__":
     server.add_insecure_port(f'[::]:{port}')
     server.start()
     logger.info(f'Recommendation service started, listening on port {port}')
+    
+    if feature_flags_available:
+        logger.info('Feature flags enabled via flagd')
+    else:
+        logger.warning('Feature flags disabled - flagd service unavailable')
+    
     server.wait_for_termination()
