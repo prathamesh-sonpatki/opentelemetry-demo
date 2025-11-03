@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,17 +122,62 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling and fallback.
+    Returns False if flagd is unavailable to allow graceful degradation.
+    """
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Log the error but don't fail the request
+        logger.warning(f"Failed to fetch feature flag '{flag_name}': {e.code()} - {e.details()}")
+        return False
+    except Exception as e:
+        # Catch any other exceptions during feature flag evaluation
+        logger.warning(f"Unexpected error fetching feature flag '{flag_name}': {str(e)}")
+        return False
+
+
+def init_flagd_provider_with_retry(max_retries=3, retry_delay=2):
+    """
+    Initialize FlagdProvider with retry logic and longer timeouts.
+    Returns True if successful, False otherwise.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with explicit configuration
+            # Note: FlagdProvider uses gRPC under the hood with default timeout
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Additional options can be added here based on OpenFeature Python SDK version
+            )
+            
+            api.set_provider(provider)
+            logger.info("Successfully connected to flagd")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
-    # Initialize Traces and Metrics
+    
+    # Initialize Traces and Metrics first
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
     rec_svc_metrics = init_metrics(meter)
@@ -152,6 +198,16 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    
+    # Initialize flagd provider with retry logic and graceful degradation
+    flagd_available = init_flagd_provider_with_retry(max_retries=3, retry_delay=2)
+    
+    if flagd_available:
+        # Add tracing hook only if flagd is available
+        api.add_hooks([TracingHook()])
+    else:
+        logger.warning("Starting recommendation service without feature flag support")
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
