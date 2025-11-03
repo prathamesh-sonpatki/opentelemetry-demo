@@ -8,6 +8,8 @@
 import os
 import random
 from concurrent import futures
+import time
+from threading import Thread, Event
 
 # Pip
 import grpc
@@ -38,6 +40,8 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+_flagd_provider = None
+_shutdown_event = Event()
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,14 +125,67 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling for provider issues.
+    Returns False if the provider is unavailable or encounters errors.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log but don't fail - return default value
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}")
+        return False
+
+
+def monitor_flagd_provider():
+    """
+    Monitor thread that handles flagd provider connection health.
+    Automatically reconnects on failures with exponential backoff.
+    """
+    global _flagd_provider
+    retry_delay = 1  # Start with 1 second
+    max_retry_delay = 60  # Max 60 seconds between retries
+    
+    while not _shutdown_event.is_set():
+        try:
+            if _flagd_provider is None:
+                logger.info("Initializing flagd provider connection")
+                flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+                flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+                
+                # Create provider with timeout configuration
+                _flagd_provider = FlagdProvider(
+                    host=flagd_host,
+                    port=flagd_port,
+                    deadline=300000  # 5 minute deadline in milliseconds
+                )
+                api.set_provider(_flagd_provider)
+                logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+                retry_delay = 1  # Reset retry delay on success
+            
+            # Check connection health every 30 seconds
+            _shutdown_event.wait(30)
+            
+        except Exception as e:
+            logger.warning(f"Flagd provider error: {e}. Retrying in {retry_delay} seconds...")
+            _flagd_provider = None
+            _shutdown_event.wait(retry_delay)
+            # Exponential backoff with max limit
+            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Start flagd monitor thread with graceful degradation
+    monitor_thread = Thread(target=monitor_flagd_provider, daemon=True, name="flagd-monitor")
+    monitor_thread.start()
+    logger_temp = logging.getLogger('startup')
+    logger_temp.info("Started flagd provider monitor thread")
+    
+    # Add OpenFeature tracing hook
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
@@ -170,4 +227,10 @@ if __name__ == "__main__":
     server.add_insecure_port(f'[::]:{port}')
     server.start()
     logger.info(f'Recommendation service started, listening on port {port}')
-    server.wait_for_termination()
+    
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info('Shutting down recommendation service')
+        _shutdown_event.set()
+        monitor_thread.join(timeout=5)
