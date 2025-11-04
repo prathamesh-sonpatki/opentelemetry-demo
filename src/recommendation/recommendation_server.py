@@ -121,15 +121,44 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling.
+    Returns False if flagd is unavailable to allow graceful degradation.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value to prevent service disruption
+        logger.warning(f"Failed to retrieve feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with timeout and retry settings to prevent deadline exceeded errors
+    # Set a reasonable deadline to avoid hanging connections
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Initialize FlagdProvider with timeout configuration
+        # The deadline parameter prevents hanging connections
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            deadline=10000  # 10 second timeout for gRPC calls to flagd
+        ))
+        api.add_hooks([TracingHook()])
+        logger_initialized = False  # Track logger initialization for later use
+    except Exception as e:
+        # If flagd connection fails, log warning and continue with default values
+        # This prevents the service from crashing if flagd is unavailable
+        print(f"Warning: Failed to connect to flagd at {flagd_host}:{flagd_port}: {e}")
+        print("Service will continue with default feature flag values")
+        logger_initialized = False
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -152,6 +181,10 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Log flagd connection status after logger is initialized
+    if not logger_initialized:
+        logger.warning(f"Flagd provider initialized with {flagd_host}:{flagd_port} (deadline: 10s)")
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
