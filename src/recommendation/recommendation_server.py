@@ -121,15 +121,48 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling.
+    
+    Returns False if flagd service is unavailable to prevent service disruption.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't fail the request
+        logger.warning(f"Failed to check feature flag {flag_name}: {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout configuration
+    # Note: FlagdProvider creates a streaming connection that may timeout periodically
+    # This is expected behavior for long-running gRPC streams
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Set deadline for the streaming connection (in seconds)
+        # Default is 600 seconds (10 minutes) which causes DEADLINE_EXCEEDED
+        # Increase to reduce reconnection frequency
+        flagd_deadline = int(os.environ.get('FLAGD_DEADLINE', 3600))  # 1 hour
+        
+        # Initialize FlagdProvider with custom options
+        # The provider will automatically reconnect if the stream times out
+        api.set_provider(FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=flagd_deadline
+        ))
+        api.add_hooks([TracingHook()])
+        logger.info(f"FlagdProvider initialized with host={flagd_host}, port={flagd_port}, deadline={flagd_deadline}s")
+    except Exception as e:
+        logger.error(f"Failed to initialize FlagdProvider: {e}. Feature flags will be disabled.")
+        # Continue service operation even if flagd is unavailable
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
