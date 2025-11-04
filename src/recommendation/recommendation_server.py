@@ -8,6 +8,8 @@
 import os
 import random
 from concurrent import futures
+import time
+import threading
 
 # Pip
 import grpc
@@ -121,15 +123,62 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for gRPC connection issues.
+    Returns False (safe default) if there are connection errors.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors gracefully, including DEADLINE_EXCEEDED
+        logger.warning(f"Feature flag check failed: {e.code()}, returning default value False")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.warning(f"Unexpected error checking feature flag: {e}, returning default value False")
+        return False
+
+
+def initialize_flagd_provider_with_retry():
+    """
+    Initialize FlagdProvider with retry logic to handle connection issues.
+    This runs in a background thread to prevent blocking the main application.
+    """
+    max_retries = 5
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd (attempt {attempt + 1}/{max_retries})")
+            provider = FlagdProvider(
+                host=os.environ.get('FLAGD_HOST', 'flagd'),
+                port=os.environ.get('FLAGD_PORT', 8013),
+                # Set a reasonable deadline for the event stream (24 hours)
+                # This prevents the 10-minute default timeout
+                deadline=86400000  # 24 hours in milliseconds
+            )
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            logger.info("Successfully connected to flagd")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error("Failed to connect to flagd after all retries. Feature flags will return default values.")
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider in a background thread with retry logic
+    # This prevents the main application from being blocked by flagd connection issues
+    flagd_thread = threading.Thread(target=initialize_flagd_provider_with_retry, daemon=True)
+    flagd_thread.start()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
