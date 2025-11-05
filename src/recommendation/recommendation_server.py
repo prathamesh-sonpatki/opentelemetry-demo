@@ -38,6 +38,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_available = False  # Track flagd availability
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +122,54 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with error handling.
+    Returns False if flagd is unavailable to allow graceful degradation.
+    """
+    global flagd_available
+    
+    if not flagd_available:
+        # If flagd is not available, return default value (False)
+        return False
+    
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.error(f"Error checking feature flag '{flag_name}': {str(e)}")
+        # Mark flagd as unavailable to avoid repeated errors
+        flagd_available = False
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with timeout and error handling
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Set timeout to 30 seconds to prevent indefinite blocking
+        # This addresses the DEADLINE_EXCEEDED error from EventStream
+        api.set_provider(
+            FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=30000  # 30 second timeout in milliseconds
+            )
+        )
+        api.add_hooks([TracingHook()])
+        flagd_available = True
+        print(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd connection fails, log the error but continue service startup
+        # The service will work with feature flags disabled
+        print(f"Warning: Could not connect to flagd at {flagd_host}:{flagd_port}: {str(e)}")
+        print("Continuing without feature flag support. Feature flags will return default values.")
+        flagd_available = False
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
