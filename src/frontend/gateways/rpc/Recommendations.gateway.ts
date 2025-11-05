@@ -3,6 +3,7 @@
 
 import { ChannelCredentials } from '@grpc/grpc-js';
 import { ListRecommendationsResponse, RecommendationServiceClient } from '../../protos/demo';
+import grpcRetry from '../../utils/grpc/GrpcRetry';
 
 const { RECOMMENDATION_ADDR = '' } = process.env;
 
@@ -10,11 +11,15 @@ const client = new RecommendationServiceClient(RECOMMENDATION_ADDR, ChannelCrede
 
 const RecommendationsGateway = () => ({
   listRecommendations(userId: string, productIds: string[]) {
-    return new Promise<ListRecommendationsResponse>((resolve, reject) =>
-      client.listRecommendations({ userId, productIds }, (error, response) =>
-        error ? reject(error) : resolve(response)
-      )
-    );
+    const operation = () =>
+      new Promise<ListRecommendationsResponse>((resolve, reject) =>
+        client.listRecommendations({ userId, productIds }, (error, response) =>
+          error ? reject(error) : resolve(response)
+        )
+      );
+
+    // Wrap with retry logic for resilience against transient connection failures
+    return grpcRetry.execute(operation, 'Recommendations.listRecommendations');
   },
 });
 
