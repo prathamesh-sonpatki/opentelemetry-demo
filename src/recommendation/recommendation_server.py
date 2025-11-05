@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -75,7 +76,17 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check in try-except to handle connection failures gracefully
+        cache_failure_enabled = False
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log the error but don't fail the request
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}. Defaulting to False.")
+            span.set_attribute("app.feature_flag.error", True)
+            span.set_attribute("app.feature_flag.error_message", str(e))
+        
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +132,72 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+    """
+    Check feature flag with timeout handling.
+    Raises exception if flagd service is unavailable.
+    """
     client = api.get_client()
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    
+    Returns:
+        True if initialization successful, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to FlagD at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with custom configuration
+            # Note: The provider will handle EventStream reconnections internally
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Use default deadline of 5 seconds for RPC calls
+                # The EventStream will automatically reconnect on failure
+            )
+            
+            api.set_provider(provider)
+            logger.info("Successfully connected to FlagD service")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to connect to FlagD service (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                delay = initial_delay * (2 ** attempt)
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to connect to FlagD after {max_retries} attempts. Feature flags will be disabled.")
+                return False
+    
+    return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagD provider with retry logic
+    # If FlagD is unavailable, the service will continue without feature flags
+    flagd_available = initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1)
+    
+    if flagd_available:
+        # Add OpenTelemetry tracing hook for feature flag operations
+        api.add_hooks([TracingHook()])
+    else:
+        logger.warning("FlagD service is not available. Feature flags are disabled. Service will continue normally.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
