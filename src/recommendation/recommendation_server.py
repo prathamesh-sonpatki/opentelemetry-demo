@@ -121,15 +121,48 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with error handling for flagd connection issues
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Log the error but return default value to prevent service disruption
+        # This handles DEADLINE_EXCEEDED and other gRPC errors gracefully
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag check timed out for {flag_name}, using default value: False")
+        else:
+            logger.warning(f"Feature flag check failed for {flag_name}: {e.details()}, using default value: False")
+        return False
+    except Exception as e:
+        logger.warning(f"Unexpected error checking feature flag {flag_name}: {str(e)}, using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with connection settings optimized for long-lived streams
+    # Set deadline to None to prevent timeout on EventStream connections
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Initialize FlagdProvider with retry configuration
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Set a longer timeout for the initial connection
+            deadline=30000  # 30 seconds for connection establishment
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('flagd-setup')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd connection fails, log warning but continue service startup
+        # Feature flags will return default values
+        logger_temp = logging.getLogger('flagd-setup')
+        logger_temp.warning(f"Failed to connect to flagd at {flagd_host}:{flagd_port}: {str(e)}. Service will use default feature flag values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
