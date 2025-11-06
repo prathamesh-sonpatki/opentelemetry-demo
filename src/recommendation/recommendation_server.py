@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_provider_initialized = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +123,114 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with graceful error handling.
+    
+    Returns the feature flag value from flagd if available, 
+    otherwise returns False as a safe default to prevent service disruption.
+    """
+    global flagd_provider_initialized
+    
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Attempt to get the flag value with a timeout
+        # This will use the flagd provider's internal timeout configuration
+        flag_value = client.get_boolean_value(flag_name, False)
+        
+        # Log successful flag retrieval
+        span = trace.get_current_span()
+        span.set_attribute(f"app.feature_flag.{flag_name}", flag_value)
+        span.set_attribute("app.feature_flag.source", "flagd")
+        
+        return flag_value
+        
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (deadline exceeded, unavailable, etc.)
+        status_code = e.code() if hasattr(e, 'code') else 'UNKNOWN'
+        logger.warning(
+            f"Feature flag '{flag_name}' check failed with gRPC error: {status_code}. "
+            f"Using default value: False. Error: {str(e)}"
+        )
+        
+        # Add error details to span
+        span = trace.get_current_span()
+        span.set_attribute(f"app.feature_flag.{flag_name}", False)
+        span.set_attribute("app.feature_flag.source", "default")
+        span.set_attribute("app.feature_flag.error", str(status_code))
+        span.record_exception(e)
+        
+        return False
+        
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.warning(
+            f"Unexpected error checking feature flag '{flag_name}': {str(e)}. "
+            f"Using default value: False."
+        )
+        
+        # Add error details to span
+        span = trace.get_current_span()
+        span.set_attribute(f"app.feature_flag.{flag_name}", False)
+        span.set_attribute("app.feature_flag.source", "default")
+        span.set_attribute("app.feature_flag.error", type(e).__name__)
+        span.record_exception(e)
+        
+        return False
+
+
+def initialize_flagd_provider():
+    """
+    Initialize the flagd provider with proper error handling and timeout configuration.
+    
+    Returns True if initialization succeeds, False otherwise.
+    """
+    global flagd_provider_initialized
+    
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+        flagd_deadline = int(os.environ.get('FLAGD_DEADLINE', '10'))  # Default 10 seconds
+        
+        logger.info(
+            f"Initializing flagd provider: host={flagd_host}, "
+            f"port={flagd_port}, deadline={flagd_deadline}s"
+        )
+        
+        # Initialize the flagd provider with timeout configuration
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=flagd_deadline
+        )
+        
+        # Set the provider in OpenFeature API
+        api.set_provider(provider)
+        
+        # Add tracing hook for observability
+        api.add_hooks([TracingHook()])
+        
+        flagd_provider_initialized = True
+        logger.info("Flagd provider initialized successfully")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(
+            f"Failed to initialize flagd provider: {str(e)}. "
+            f"Feature flags will use default values."
+        )
+        flagd_provider_initialized = False
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with error handling
+    # Service continues even if flagd is unavailable
+    initialize_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
