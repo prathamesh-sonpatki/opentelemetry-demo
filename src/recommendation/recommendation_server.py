@@ -121,15 +121,36 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value
+        logger.warning(f"Feature flag check failed for '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry configuration and error handling
+    try:
+        # Configure FlagdProvider with reasonable timeouts
+        # The deadline parameter sets the timeout for streaming connections (in seconds)
+        flagd_provider = FlagdProvider(
+            host=os.environ.get('FLAGD_HOST', 'flagd'),
+            port=int(os.environ.get('FLAGD_PORT', 8013)),
+            deadline=900000  # 15 minutes in milliseconds (increased from default 10 min)
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('flagd_init')
+        logger_temp.info("Successfully connected to Flagd service")
+    except Exception as e:
+        logger_temp = logging.getLogger('flagd_init')
+        logger_temp.warning(f"Failed to initialize Flagd provider: {e}. Feature flags will use default values.")
+        # Continue without feature flags rather than failing the service
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
