@@ -128,7 +128,32 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Configure flagd provider with proper timeout and retry settings
+    # to prevent gRPC DEADLINE_EXCEEDED exceptions on long-lived EventStream connections
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    # Default deadline of 10 minutes (600000ms) - configurable via environment
+    flagd_deadline_ms = int(os.environ.get('FLAGD_DEADLINE_MS', 600000))
+    
+    try:
+        # Initialize FlagdProvider with explicit deadline and retry configuration
+        # This prevents timeout exceptions on the EventStream RPC call
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=flagd_deadline_ms,
+            max_attempts=5,  # Retry up to 5 times on connection failure
+            initial_backoff=1000  # Start with 1 second backoff between retries
+        )
+        api.set_provider(flagd_provider)
+        logger_temp = logging.getLogger('setup')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port} with deadline={flagd_deadline_ms}ms")
+    except Exception as e:
+        # Log error but continue - service can function with default feature flag values
+        logger_temp = logging.getLogger('setup')
+        logger_temp.error(f"Failed to initialize flagd provider: {e}. Continuing with default feature flag values.")
+    
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
