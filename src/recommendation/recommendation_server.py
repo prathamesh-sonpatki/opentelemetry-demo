@@ -8,6 +8,7 @@
 import os
 import random
 from concurrent import futures
+import time
 
 # Pip
 import grpc
@@ -38,6 +39,8 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+# Flag to track if feature flags are available
+feature_flags_available = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +124,75 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with graceful degradation if flagd is unavailable.
+    Returns False if feature flags are not available or on error.
+    """
+    global feature_flags_available
+    
+    if not feature_flags_available:
+        # Feature flags not available, return default (disabled)
+        return False
+    
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def initialize_feature_flags():
+    """
+    Initialize FlagdProvider with timeout and error handling.
+    Returns True if successfully initialized, False otherwise.
+    """
+    global feature_flags_available
+    
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port}")
+        
+        # Configure FlagdProvider with custom options
+        # Note: The deadline parameter sets the gRPC timeout for streaming connections
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=30000  # 30 second timeout in milliseconds
+        )
+        
+        # Set provider with timeout
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        # Test the connection by attempting to get a flag value with timeout
+        client = api.get_client()
+        test_result = client.get_boolean_value("recommendationCacheFailure", False)
+        
+        logger.info(f"Successfully connected to flagd. Test flag value: {test_result}")
+        feature_flags_available = True
+        return True
+        
+    except grpc.RpcError as e:
+        logger.warning(f"gRPC error connecting to flagd: {e}. Feature flags will be disabled.")
+        feature_flags_available = False
+        return False
+    except Exception as e:
+        logger.warning(f"Failed to initialize feature flags: {e}. Feature flags will be disabled.")
+        feature_flags_available = False
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flags with error handling
+    # Service will continue to work even if flagd is unavailable
+    initialize_feature_flags()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
