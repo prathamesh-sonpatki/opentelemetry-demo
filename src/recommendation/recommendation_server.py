@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,14 +122,70 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Error checking feature flag {flag_name}: {e}")
+        # Return default value on error to ensure service continues
+        return False
+
+
+def initialize_flagd_provider_with_retry(host: str, port: int, max_retries: int = 3):
+    """
+    Initialize FlagdProvider with retry logic and proper timeout configuration.
+    
+    This prevents DEADLINE_EXCEEDED errors on EventStream connections by:
+    1. Configuring longer deadlines for streaming RPCs
+    2. Adding retry logic with exponential backoff
+    3. Graceful error handling to prevent service disruption
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure FlagdProvider with increased deadline and keep-alive settings
+            # EventStream is a long-lived streaming connection that needs longer timeouts
+            provider = FlagdProvider(
+                host=host,
+                port=port,
+                # Increase deadline for streaming connections to prevent DEADLINE_EXCEEDED
+                deadline=int(os.environ.get('FLAGD_DEADLINE_MS', '60000')),  # Default 60 seconds
+                # Enable keep-alive to maintain long-lived connections
+                keep_alive=True,
+                keep_alive_time_ms=int(os.environ.get('FLAGD_KEEPALIVE_MS', '30000')),  # Default 30 seconds
+            )
+            
+            api.set_provider(provider)
+            logger.info("FlagdProvider initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                wait_time = 2 ** attempt
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                # On final failure, log error but allow service to continue with feature flags disabled
+                logger.error(f"Failed to initialize FlagdProvider after {max_retries} attempts. Feature flags will be disabled.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with retry logic and proper timeout configuration
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    initialize_flagd_provider_with_retry(flagd_host, flagd_port)
+    
+    # Add OpenTelemetry tracing hook for feature flag operations
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
