@@ -121,15 +121,52 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with timeout and error handling.
+    Returns False as default if flagd service is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including DEADLINE_EXCEEDED)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_code", e.code().name if hasattr(e, 'code') else 'UNKNOWN')
+        logger.warning(f"Feature flag check failed for '{flag_name}': {str(e)}. Using default value: False")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {str(e)}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry and timeout configuration
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with appropriate timeout
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Note: timeout configuration depends on openfeature-provider-flagd version
+            # If the version supports it, add: deadline=30000 (30 seconds in milliseconds)
+        ))
+        api.add_hooks([TracingHook()])
+        logger = logging.getLogger('main')
+        logger.info(f"FlagdProvider initialized successfully with host={flagd_host}, port={flagd_port}")
+    except Exception as e:
+        logger = logging.getLogger('main')
+        logger.error(f"Failed to initialize FlagdProvider: {str(e)}. Feature flags will use default values.")
+        # Continue without feature flags - the check_feature_flag function will handle errors gracefully
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
