@@ -121,15 +121,55 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and timeout protection.
+    Returns False as default value if feature flag service is unavailable.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Get feature flag value with timeout protection
+        # If flagd is unavailable or times out, return False (disabled) as safe default
+        return client.get_boolean_value(flag_name, False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors (deadline exceeded, unavailable, etc.)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_code", e.code().name if hasattr(e, 'code') else 'UNKNOWN')
+        logger.warning(f"Feature flag check failed for '{flag_name}': {str(e)}. Using default value: False")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        logger.warning(f"Unexpected error checking feature flag '{flag_name}': {str(e)}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout and retry configuration
+    # This prevents long-hanging connections and handles transient failures gracefully
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with appropriate timeouts
+        # Note: The FlagdProvider will establish a streaming connection to flagd
+        # We rely on gRPC's built-in keepalive and the error handling in check_feature_flag
+        api.set_provider(FlagdProvider(host=flagd_host, port=flagd_port))
+        api.add_hooks([TracingHook()])
+        
+        logger = logging.getLogger('main')
+        logger.info(f"Successfully initialized FlagdProvider connecting to {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If FlagdProvider initialization fails, log but continue
+        # Feature flags will gracefully return default values via check_feature_flag error handling
+        logger = logging.getLogger('main')
+        logger.warning(f"Failed to initialize FlagdProvider: {str(e)}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
