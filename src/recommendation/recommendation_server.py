@@ -38,6 +38,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_provider_available = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +122,67 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with graceful fallback if flagd is unavailable.
+    """
+    global flagd_provider_available
+    
+    if not flagd_provider_available:
+        # If flagd provider failed to initialize, return default value
+        logger.warning(f"FlagD provider unavailable, using default value for {flag_name}")
+        return False
+    
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Handle any errors during flag evaluation gracefully
+        logger.error(f"Error evaluating feature flag {flag_name}: {e}")
+        return False
+
+
+def init_flagd_provider():
+    """
+    Initialize FlagD provider with proper timeout and error handling.
+    Returns True if successful, False otherwise.
+    """
+    global flagd_provider_available
+    
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        logger.info(f"Attempting to connect to FlagD at {flagd_host}:{flagd_port}")
+        
+        # Initialize FlagD provider with increased timeout and keep-alive settings
+        # to prevent DEADLINE_EXCEEDED errors on the EventStream connection
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=300,  # 5 minutes timeout for long-lived streaming connections
+            keep_alive_time=60000,  # Send keepalive ping every 60 seconds
+        )
+        
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        logger.info("Successfully initialized FlagD provider with extended timeout configuration")
+        flagd_provider_available = True
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize FlagD provider: {e}")
+        logger.warning("Service will continue without feature flag support")
+        flagd_provider_available = False
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagD provider with proper error handling
+    init_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
