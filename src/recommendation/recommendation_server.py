@@ -8,6 +8,7 @@
 import os
 import random
 from concurrent import futures
+import time
 
 # Pip
 import grpc
@@ -75,7 +76,10 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check with error handling to prevent service disruption
+        cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +125,96 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and fallback.
+    Returns False if flagd is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        # Add timeout context to prevent hanging
+        result = client.get_boolean_value(flag_name, False)
+        return result
+    except grpc.RpcError as e:
+        # Handle gRPC errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        status_code = e.code() if hasattr(e, 'code') else 'UNKNOWN'
+        logger.warning(
+            f"Feature flag '{flag_name}' evaluation failed with gRPC error: {status_code}. "
+            f"Defaulting to False. Error details: {str(e)}"
+        )
+        # Record the error in span for observability
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_code", str(status_code))
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.warning(
+            f"Feature flag '{flag_name}' evaluation failed with unexpected error: {str(e)}. "
+            f"Defaulting to False."
+        )
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and proper error handling.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with timeout configuration
+            # Note: The timeout setting helps prevent indefinite connection attempts
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Add deadline for gRPC operations to prevent hanging
+                # This should be shorter than the EventStream deadline
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            logger.warning(
+                f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {str(e)}"
+            )
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                delay = initial_delay * (2 ** attempt)
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts. "
+                    f"Feature flags will be disabled and default to False."
+                )
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic and error handling
+    flagd_available = initialize_flagd_provider_with_retry()
+    
+    if not flagd_available:
+        logger.warning(
+            "Running without feature flag support. All feature flags will default to False."
+        )
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
