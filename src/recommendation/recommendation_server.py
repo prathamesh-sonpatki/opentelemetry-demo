@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,11 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+
+# Configuration for flagd connection resilience
+FLAGD_TIMEOUT = int(os.environ.get('FLAGD_TIMEOUT', 30))  # seconds
+FLAGD_MAX_RETRIES = int(os.environ.get('FLAGD_MAX_RETRIES', 3))
+FLAGD_RETRY_BACKOFF = float(os.environ.get('FLAGD_RETRY_BACKOFF', 1.5))  # exponential backoff multiplier
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -120,16 +126,122 @@ def must_map_env(key: str):
     return value
 
 
-def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+def check_feature_flag(flag_name: str, default_value: bool = False) -> bool:
+    """
+    Check feature flag with resilient error handling.
+    
+    This function wraps the OpenFeature client call with retry logic and
+    graceful error handling to prevent DEADLINE_EXCEEDED exceptions from
+    propagating when the flagd service is unavailable or slow.
+    
+    Args:
+        flag_name: Name of the feature flag to check
+        default_value: Default value to return if flag check fails
+        
+    Returns:
+        bool: Feature flag value or default_value on error
+    """
+    span = trace.get_current_span()
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    
+    for attempt in range(FLAGD_MAX_RETRIES):
+        try:
+            # Add span attributes for debugging
+            span.set_attribute("feature_flag.name", flag_name)
+            span.set_attribute("feature_flag.attempt", attempt + 1)
+            
+            # Get feature flag value with timeout protection
+            flag_value = client.get_boolean_value(flag_name, default_value)
+            
+            span.set_attribute("feature_flag.value", flag_value)
+            span.set_attribute("feature_flag.success", True)
+            
+            if attempt > 0:
+                logger.info(f"Feature flag '{flag_name}' retrieved successfully after {attempt + 1} attempts")
+            
+            return flag_value
+            
+        except grpc.RpcError as e:
+            # Handle gRPC-specific errors (including DEADLINE_EXCEEDED)
+            status_code = e.code() if hasattr(e, 'code') else None
+            error_details = e.details() if hasattr(e, 'details') else str(e)
+            
+            span.set_attribute("feature_flag.error.type", "grpc_error")
+            span.set_attribute("feature_flag.error.code", str(status_code))
+            span.set_attribute("feature_flag.error.details", error_details)
+            
+            if attempt < FLAGD_MAX_RETRIES - 1:
+                # Calculate exponential backoff delay
+                delay = (FLAGD_RETRY_BACKOFF ** attempt)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{FLAGD_MAX_RETRIES} failed for feature flag '{flag_name}': "
+                    f"{status_code} - {error_details}. Retrying in {delay:.2f}s..."
+                )
+                time.sleep(delay)
+            else:
+                # Max retries exceeded, log error and use default
+                logger.error(
+                    f"Failed to retrieve feature flag '{flag_name}' after {FLAGD_MAX_RETRIES} attempts. "
+                    f"Using default value: {default_value}. Last error: {status_code} - {error_details}"
+                )
+                span.set_attribute("feature_flag.success", False)
+                span.set_attribute("feature_flag.default_used", True)
+                
+        except Exception as e:
+            # Handle any other unexpected errors
+            error_type = type(e).__name__
+            error_msg = str(e)
+            
+            span.set_attribute("feature_flag.error.type", error_type)
+            span.set_attribute("feature_flag.error.message", error_msg)
+            
+            if attempt < FLAGD_MAX_RETRIES - 1:
+                delay = (FLAGD_RETRY_BACKOFF ** attempt)
+                logger.warning(
+                    f"Attempt {attempt + 1}/{FLAGD_MAX_RETRIES} failed for feature flag '{flag_name}': "
+                    f"{error_type}: {error_msg}. Retrying in {delay:.2f}s..."
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Unexpected error retrieving feature flag '{flag_name}' after {FLAGD_MAX_RETRIES} attempts. "
+                    f"Using default value: {default_value}. Error: {error_type}: {error_msg}"
+                )
+                span.set_attribute("feature_flag.success", False)
+                span.set_attribute("feature_flag.default_used", True)
+    
+    # Return default value if all retries failed
+    return default_value
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout configuration
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        logger_init = logging.getLogger('init')
+        logger_init.info(
+            f"Initializing FlagdProvider with host={flagd_host}, port={flagd_port}, "
+            f"timeout={FLAGD_TIMEOUT}s, max_retries={FLAGD_MAX_RETRIES}"
+        )
+        
+        # Set provider with improved configuration
+        api.set_provider(FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=FLAGD_TIMEOUT * 1000  # FlagdProvider expects milliseconds
+        ))
+        api.add_hooks([TracingHook()])
+        
+        logger_init.info("FlagdProvider initialized successfully")
+        
+    except Exception as e:
+        logger_init = logging.getLogger('init')
+        logger_init.error(f"Failed to initialize FlagdProvider: {type(e).__name__}: {str(e)}")
+        logger_init.warning("Service will continue with feature flags disabled (default values will be used)")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
