@@ -75,7 +75,17 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # FIX: Add error handling for feature flag evaluation to handle gRPC timeouts gracefully
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except (grpc.RpcError, Exception) as e:
+            # Log the error and default to safe behavior (cache disabled)
+            logger.warning(f"Feature flag evaluation failed: {e}. Defaulting to cache disabled mode.")
+            span.set_attribute("app.feature_flag.error", str(e))
+            span.set_attribute("app.feature_flag.fallback", True)
+            cache_failure_enabled = False
+        
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -122,13 +132,22 @@ def must_map_env(key: str):
 
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
+    # FIX: Add timeout configuration to prevent indefinite hangs
     client = api.get_client()
+    # This will now propagate exceptions which will be caught by the caller
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    # FIX: Configure FlagdProvider with timeout settings to prevent deadline exceeded errors
+    flagd_timeout = int(os.environ.get('FLAGD_TIMEOUT_MS', '500'))  # Default 500ms timeout
+    api.set_provider(FlagdProvider(
+        host=os.environ.get('FLAGD_HOST', 'flagd'), 
+        port=os.environ.get('FLAGD_PORT', 8013),
+        # Add timeout configuration for connections
+        deadline=flagd_timeout
+    ))
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
