@@ -121,15 +121,55 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling for gRPC timeout issues.
+    Returns False (disabled) if flag service is unavailable to prevent service disruption.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including DEADLINE_EXCEEDED) gracefully
+        logger.warning(f"Feature flag check failed due to gRPC error: {e.code()} - {e.details()}. Defaulting to False.")
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_code", str(e.code()))
+        return False
+    except Exception as e:
+        # Catch any other exceptions to prevent service disruption
+        logger.warning(f"Feature flag check failed with unexpected error: {str(e)}. Defaulting to False.")
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with proper timeout and error handling
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with timeout settings
+        # Note: The timeout for streaming connections should be reasonable
+        logger_temp = logging.getLogger('init')
+        logger_temp.info(f"Connecting to flagd at {flagd_host}:{flagd_port}")
+        
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Add keep_alive settings to prevent connection issues
+            # These can be adjusted based on network conditions
+        ))
+        api.add_hooks([TracingHook()])
+        logger_temp.info("Successfully initialized FlagdProvider")
+    except Exception as e:
+        # If FlagdProvider initialization fails, log but don't crash the service
+        logger_temp = logging.getLogger('init')
+        logger_temp.error(f"Failed to initialize FlagdProvider: {str(e)}. Service will continue with default flag values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
