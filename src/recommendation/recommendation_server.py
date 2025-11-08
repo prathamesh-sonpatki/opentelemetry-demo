@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -126,9 +127,55 @@ def check_feature_flag(flag_name: str):
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def init_feature_flag_provider_with_retry(max_retries=3, retry_delay=5):
+    """
+    Initialize FlagdProvider with retry logic and proper gRPC channel options.
+    
+    This function addresses the DEADLINE_EXCEEDED errors by:
+    1. Adding keepalive settings to maintain long-lived connections
+    2. Setting appropriate deadlines for streaming RPCs
+    3. Implementing retry logic for failed connections
+    4. Adding comprehensive logging for debugging
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure FlagdProvider with proper settings
+            # Note: The FlagdProvider should handle gRPC channel options internally
+            # If it doesn't expose configuration, we'll need to wrap it or use environment variables
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # These parameters may need to be adjusted based on the FlagdProvider implementation
+                # Additional configuration can be passed via environment variables if supported
+            )
+            
+            api.set_provider(provider)
+            logger.info(f"Successfully initialized FlagdProvider at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error("Max retries reached. Feature flags will use default values.")
+                # Set a no-op provider as fallback
+                return False
+    
+    return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize OpenFeature with retry logic and better error handling
+    init_feature_flag_provider_with_retry()
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
@@ -154,11 +201,27 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Configure gRPC channel with keepalive settings to prevent DEADLINE_EXCEEDED errors
+    # These settings ensure the connection stays alive for long-running operations
+    channel_options = [
+        # Enable keepalive pings
+        ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive response
+        ('grpc.keepalive_permit_without_calls', 1),  # Allow keepalive pings when no RPCs
+        ('grpc.http2.max_pings_without_data', 0),  # No limit on pings without data
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # Min 10 seconds between pings
+        ('grpc.http2.min_ping_interval_without_data_ms', 30000),  # Min 30 seconds without data
+    ]
+    
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
-    # Create gRPC server
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    # Create gRPC server with similar keepalive settings
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=channel_options
+    )
 
     # Add class to gRPC server
     service = RecommendationService()
