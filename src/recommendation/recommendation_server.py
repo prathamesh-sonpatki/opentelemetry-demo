@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_available = True
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,16 +123,95 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for flagd connection issues.
+    Returns False (safe default) if flagd is unavailable.
+    """
+    global flagd_available
+    
+    if not flagd_available:
+        logger.debug(f"Flagd unavailable, returning default value for flag: {flag_name}")
+        return False
+    
+    try:
+        client = api.get_client()
+        return client.get_boolean_value(flag_name, False)
+    except grpc.RpcError as e:
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Flagd deadline exceeded for flag '{flag_name}'. Using default value.")
+            # Don't mark flagd as unavailable for individual timeouts
+        else:
+            logger.error(f"Flagd RPC error for flag '{flag_name}': {e}. Using default value.")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {e}. Using default value.")
+        return False
+
+
+def initialize_flagd_provider(max_retries=3, initial_delay=1.0):
+    """
+    Initialize FlagdProvider with retry logic and proper timeout configuration.
+    Returns True if successful, False otherwise.
+    """
+    global flagd_available
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    # Configurable deadline for flagd operations (default 30 seconds)
+    flagd_deadline = int(os.environ.get('FLAGD_DEADLINE_SECONDS', '30'))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=flagd_deadline
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            flagd_available = True
+            return True
+            
+        except grpc.RpcError as e:
+            if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                logger.warning(f"Flagd connection timeout (attempt {attempt + 1}/{max_retries}): {e}")
+            else:
+                logger.error(f"Flagd RPC error (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                delay = initial_delay * (2 ** attempt)
+                logger.info(f"Retrying flagd connection in {delay:.1f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                flagd_available = False
+                return False
+                
+        except Exception as e:
+            logger.error(f"Unexpected error connecting to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                logger.info(f"Retrying flagd connection in {delay:.1f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will be disabled.")
+                flagd_available = False
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
+    
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
@@ -152,6 +233,10 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Initialize flagd provider with retry logic
+    # Service will continue even if flagd is unavailable
+    initialize_flagd_provider(max_retries=3, initial_delay=1.0)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
