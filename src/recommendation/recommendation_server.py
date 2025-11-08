@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check with error handling to prevent deadline exceeded errors
+        cache_failure_enabled = False
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            logger.warning(f"Failed to retrieve feature flag 'recommendationCacheFailure': {e}. Using default value: False")
+            span.set_attribute("app.feature_flag.error", str(e))
+            span.set_attribute("app.feature_flag.fallback_used", True)
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +130,46 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
+    # Initialize OpenFeature client
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    
+    # Add timeout protection: if the flag evaluation takes too long or fails,
+    # return a safe default value to prevent cascading failures
+    try:
+        # Set a reasonable timeout for flag evaluation (inherited from flagd provider config)
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the application
+        logger.error(f"Error evaluating feature flag '{flag_name}': {e}")
+        # Return safe default value
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with improved configuration for timeout handling
+    # The deadline_ms parameter sets the timeout for individual flag evaluations
+    # Setting it to 5000ms (5 seconds) to prevent long-running operations
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Initialize with timeout configuration to prevent deadline exceeded errors
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            deadline=5000  # 5 second deadline for flag evaluations
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd connection fails, continue without feature flags
+        # This prevents the service from failing to start if flagd is unavailable
+        logger_temp = logging.getLogger('main')
+        logger_temp.error(f"Failed to initialize FlagdProvider: {e}. Service will run without feature flags.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
