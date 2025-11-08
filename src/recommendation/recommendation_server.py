@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -126,12 +127,59 @@ def check_feature_flag(flag_name: str):
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def initialize_flagd_provider_with_retry(host: str, port: int, max_retries: int = 3, backoff_factor: float = 2.0):
+    """
+    Initialize FlagdProvider with retry logic and exponential backoff.
+    
+    Args:
+        host: The flagd service hostname
+        port: The flagd service port
+        max_retries: Maximum number of retry attempts
+        backoff_factor: Multiplier for exponential backoff
+    
+    Returns:
+        bool: True if initialization successful, False otherwise
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd service at {host}:{port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Create FlagdProvider with custom timeout configuration
+            # The FlagdProvider will establish an EventStream connection to flagd
+            provider = FlagdProvider(
+                host=host,
+                port=port,
+                # Add timeout configuration to prevent indefinite blocking
+                deadline=30000  # 30 seconds timeout in milliseconds
+            )
+            
+            api.set_provider(provider)
+            logger.info(f"Successfully connected to flagd service at {host}:{port}")
+            return True
+            
+        except Exception as e:
+            wait_time = backoff_factor ** attempt
+            logger.warning(
+                f"Failed to connect to flagd service (attempt {attempt + 1}/{max_retries}): {str(e)}. "
+                f"{'Retrying in ' + str(wait_time) + ' seconds...' if attempt < max_retries - 1 else 'Max retries reached.'}"
+            )
+            
+            if attempt < max_retries - 1:
+                time.sleep(wait_time)
+            else:
+                logger.error(
+                    f"Unable to connect to flagd service at {host}:{port} after {max_retries} attempts. "
+                    "Feature flags will not be available."
+                )
+                return False
+    
+    return False
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
-    # Initialize Traces and Metrics
+    
+    # Initialize Traces and Metrics first (needed for logging)
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
     rec_svc_metrics = init_metrics(meter)
@@ -152,6 +200,18 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Initialize flagd provider with retry logic
+    # This prevents the service from crashing if flagd is not immediately available
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    flagd_connected = initialize_flagd_provider_with_retry(flagd_host, flagd_port)
+    
+    if not flagd_connected:
+        logger.warning("Starting recommendation service without feature flag support")
+    
+    # Add OpenTelemetry tracing hook for feature flag evaluations
+    api.add_hooks([TracingHook()])
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
