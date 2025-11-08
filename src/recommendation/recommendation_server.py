@@ -8,6 +8,7 @@
 import os
 import random
 from concurrent import futures
+import time
 
 # Pip
 import grpc
@@ -121,14 +122,71 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with graceful error handling.
+    Returns False if flagd is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        # Get flag value with default fallback
+        return client.get_boolean_value(flag_name, False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including DEADLINE_EXCEEDED)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", str(type(e).__name__))
+        logger.warning(f"Feature flag evaluation failed for '{flag_name}': {e}. Using default value: False")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", str(type(e).__name__))
+        logger.warning(f"Unexpected error evaluating feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def init_flagd_provider_with_retry(max_retries=3, retry_delay=2):
+    """
+    Initialize FlagdProvider with retry logic and timeout configuration.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with timeout configuration
+            # The deadline parameter helps prevent indefinite hangs
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=600000  # 10 minutes in milliseconds, matching gRPC default but explicit
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            logger.info("Successfully connected to flagd service")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+            else:
+                logger.error(f"Failed to connect to flagd after {max_retries} attempts. Feature flags will use default values.")
+                return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with retry logic
+    init_flagd_provider_with_retry()
+    
+    # Add OpenTelemetry tracing hook for feature flag operations
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
