@@ -121,15 +121,43 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value if flag service is unavailable
+        logger.warning(f"Failed to retrieve feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with improved timeout and retry configuration
+    # to prevent DEADLINE_EXCEEDED errors on EventStream connections
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with connection settings
+        # The deadline parameter helps prevent long-running stream timeouts
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=30000,  # 30 second deadline for gRPC calls (in milliseconds)
+            stream_deadline_ms=3600000,  # 1 hour deadline for streaming (to reduce reconnection frequency)
+            max_event_stream_retries=5,  # Retry stream connection failures
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_created = False
+    except Exception as e:
+        # If flagd provider initialization fails, log and continue without feature flags
+        # This prevents the service from crashing if flagd is unavailable
+        logger_created = True
+        logger = logging.getLogger('main')
+        logger.error(f"Failed to initialize FlagdProvider: {e}. Feature flags will be disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -150,7 +178,8 @@ if __name__ == "__main__":
     handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
 
     # Attach OTLP handler to logger
-    logger = logging.getLogger('main')
+    if not logger_created:
+        logger = logging.getLogger('main')
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
