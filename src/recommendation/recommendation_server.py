@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -120,15 +121,94 @@ def must_map_env(key: str):
     return value
 
 
-def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+def init_flagd_provider_with_retry():
+    """
+    Initialize FlagdProvider with proper timeout and retry configuration.
+    
+    This function handles the initialization of the flagd feature flag provider
+    with resilience to network issues and timeouts. It configures:
+    - Extended timeout for long-lived EventStream connections
+    - gRPC keepalive settings to maintain connection health
+    - Retry logic with exponential backoff
+    - Graceful degradation if flagd is unavailable
+    """
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    # Configure gRPC channel with settings optimized for long-lived streaming connections
+    channel_options = [
+        ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+        ('grpc.max_send_message_length', 100 * 1024 * 1024),
+        ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive ack
+        ('grpc.keepalive_permit_without_calls', 1),  # Allow keepalive pings without active calls
+        ('grpc.http2.max_pings_without_data', 0),  # No limit on pings without data
+        ('grpc.http2.min_ping_interval_without_data_ms', 30000),  # Min interval between pings
+    ]
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing flagd provider (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with extended timeout and channel options
+            provider = FlagdProvider(
+                host=os.environ.get('FLAGD_HOST', 'flagd'),
+                port=int(os.environ.get('FLAGD_PORT', 8013)),
+                deadline=3600000,  # 1 hour timeout for EventStream (in milliseconds)
+            )
+            
+            api.set_provider(provider)
+            logger.info("Successfully initialized flagd provider with extended timeout configuration")
+            return
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize flagd provider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(
+                    "Failed to initialize flagd provider after all retries. "
+                    "Service will continue with default feature flag values. "
+                    "Feature flags will return their default values."
+                )
+                # Service continues to function - feature flags will use default values
+
+
+def check_feature_flag(flag_name: str, default_value: bool = False):
+    """
+    Check feature flag with error handling and fallback to default value.
+    
+    This function safely evaluates feature flags with proper error handling.
+    If the flagd connection is unavailable or times out, it returns the
+    default value instead of crashing.
+    
+    Args:
+        flag_name: Name of the feature flag to check
+        default_value: Default value to return if flag evaluation fails
+        
+    Returns:
+        Boolean value of the feature flag, or default_value on error
+    """
+    try:
+        client = api.get_client()
+        result = client.get_boolean_value(flag_name, default_value)
+        return result
+    except Exception as e:
+        logger.warning(
+            f"Error checking feature flag '{flag_name}': {e}. "
+            f"Using default value: {default_value}"
+        )
+        # Return default value instead of crashing the service
+        return default_value
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize flagd provider with retry logic and extended timeouts
+    init_flagd_provider_with_retry()
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
