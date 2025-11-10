@@ -75,7 +75,15 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # If feature flag check fails, log warning and continue with cache disabled
+            logger.warning(f"Feature flag check failed, disabling cache: {e}")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +129,50 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with proper error handling.
+    
+    Note: FlagdProvider EventStream gRPC connection may time out periodically.
+    This is handled gracefully by returning the default value on connection errors.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't fail the request
+        logger.warning(f"Feature flag check failed for '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with connection settings
+    # Note: The EventStream gRPC method may experience DEADLINE_EXCEEDED errors
+    # The provider should handle reconnection automatically
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Set keep_alive to detect broken connections and reconnect
+            keep_alive=True,
+            # Configure deadline for EventStream (default is 600s = 10 minutes)
+            # Increase to 3600s (1 hour) to reduce reconnection frequency
+            deadline=3600000  # in milliseconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If flagd connection fails, log warning but continue service startup
+        # Feature flag checks will return default values
+        logger_temp = logging.getLogger('main')
+        logger_temp.warning(f"Failed to connect to flagd: {e}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
