@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,109 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+
+# Circuit breaker state management
+circuit_breaker_state = {
+    'failures': 0,
+    'last_failure_time': 0,
+    'open': False,
+    'max_failures': 5,
+    'timeout': 60  # seconds to wait before trying again
+}
+
+
+def reset_circuit_breaker():
+    """Reset circuit breaker after successful connection"""
+    circuit_breaker_state['failures'] = 0
+    circuit_breaker_state['open'] = False
+    circuit_breaker_state['last_failure_time'] = 0
+
+
+def open_circuit_breaker():
+    """Open circuit breaker after too many failures"""
+    circuit_breaker_state['open'] = True
+    circuit_breaker_state['last_failure_time'] = time.time()
+    logger.warning("Circuit breaker opened - too many connection failures to product catalog service")
+
+
+def should_attempt_connection():
+    """Check if we should attempt connection based on circuit breaker state"""
+    if not circuit_breaker_state['open']:
+        return True
+    
+    # Check if timeout has elapsed to try again
+    elapsed = time.time() - circuit_breaker_state['last_failure_time']
+    if elapsed > circuit_breaker_state['timeout']:
+        logger.info("Circuit breaker timeout elapsed, attempting to reconnect")
+        return True
+    
+    return False
+
+
+def call_product_catalog_with_retry(max_retries=3, base_delay=1):
+    """
+    Call product catalog service with exponential backoff retry logic
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay between retries in seconds
+    
+    Returns:
+        List of product IDs or None if all retries failed
+    """
+    if not should_attempt_connection():
+        logger.warning("Circuit breaker is open, skipping product catalog call")
+        return None
+    
+    for attempt in range(max_retries):
+        try:
+            # Add timeout to prevent hanging connections
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=5.0  # 5 second timeout
+            )
+            response_ids = [x.id for x in cat_response.products]
+            
+            # Connection successful - reset circuit breaker
+            if circuit_breaker_state['failures'] > 0:
+                logger.info("Successfully connected to product catalog service after previous failures")
+                reset_circuit_breaker()
+            
+            return response_ids
+            
+        except grpc.RpcError as e:
+            circuit_breaker_state['failures'] += 1
+            status_code = e.code() if hasattr(e, 'code') else 'UNKNOWN'
+            
+            logger.warning(
+                f"Product catalog connection attempt {attempt + 1}/{max_retries} failed: "
+                f"status={status_code}, details={e.details() if hasattr(e, 'details') else str(e)}"
+            )
+            
+            # Check if we should open circuit breaker
+            if circuit_breaker_state['failures'] >= circuit_breaker_state['max_failures']:
+                open_circuit_breaker()
+                return None
+            
+            # Don't retry on final attempt
+            if attempt < max_retries - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                delay = base_delay * (2 ** attempt)
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"All {max_retries} attempts to connect to product catalog failed. "
+                    "Falling back to cached recommendations."
+                )
+                
+        except Exception as e:
+            logger.error(f"Unexpected error calling product catalog: {type(e).__name__}: {str(e)}")
+            circuit_breaker_state['failures'] += 1
+            return None
+    
+    return None
+
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -81,19 +185,51 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Use retry logic for product catalog call
+                response_ids = call_product_catalog_with_retry()
+                
+                if response_ids:
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                else:
+                    # Fall back to cached IDs if available
+                    if cached_ids:
+                        logger.info("Using cached product IDs as fallback")
+                        span.set_attribute("app.fallback_to_cache", True)
+                        product_ids = cached_ids
+                    else:
+                        # Return empty list if no cache available
+                        logger.warning("No cached products available, returning empty recommendations")
+                        span.set_attribute("app.no_products_available", True)
+                        return []
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            
+            # Use retry logic for product catalog call
+            response_ids = call_product_catalog_with_retry()
+            
+            if response_ids:
+                product_ids = response_ids
+                # Update cache for future fallback use
+                if not cached_ids:
+                    cached_ids = response_ids
+            else:
+                # Fall back to cached IDs if available
+                if cached_ids:
+                    logger.info("Product catalog unavailable, using cached product IDs")
+                    span.set_attribute("app.fallback_to_cache", True)
+                    product_ids = cached_ids
+                else:
+                    # Return empty list if no cache available
+                    logger.warning("Product catalog unavailable and no cache, returning empty recommendations")
+                    span.set_attribute("app.no_products_available", True)
+                    return []
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -104,9 +240,12 @@ def get_product_list(request_product_ids):
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
-        indices = random.sample(range(num_products), num_return)
-        # Fetch product ids from indices
-        prod_list = [filtered_products[i] for i in indices]
+        if num_products > 0:
+            indices = random.sample(range(num_products), num_return)
+            # Fetch product ids from indices
+            prod_list = [filtered_products[i] for i in indices]
+        else:
+            prod_list = []
 
         span.set_attribute("app.filtered_products.list", prod_list)
 
@@ -152,9 +291,22 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    logger.info(f'Connecting to product catalog at: {catalog_addr}')
+    
+    # Configure gRPC channel with better defaults for resilience
+    channel_options = [
+        ('grpc.keepalive_time_ms', 10000),  # Send keepalive ping every 10 seconds
+        ('grpc.keepalive_timeout_ms', 5000),  # Wait 5 seconds for keepalive response
+        ('grpc.keepalive_permit_without_calls', True),  # Allow keepalive pings when no calls
+        ('grpc.http2.max_pings_without_data', 0),  # Allow unlimited pings without data
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # Minimum time between pings
+        ('grpc.http2.min_ping_interval_without_data_ms', 5000),  # Minimum ping interval
+    ]
+    
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
     # Create gRPC server
