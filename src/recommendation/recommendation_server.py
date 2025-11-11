@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -64,6 +65,79 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+def call_product_catalog_with_retry(max_retries=3, initial_delay=0.1):
+    """
+    Call product catalog service with exponential backoff retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    
+    Returns:
+        List of product IDs or empty list if all retries fail
+    """
+    delay = initial_delay
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            span = trace.get_current_span()
+            span.set_attribute("app.product_catalog.attempt", attempt + 1)
+            
+            # Attempt to call the product catalog service
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=5.0  # Add timeout to prevent hanging
+            )
+            product_ids = [x.id for x in cat_response.products]
+            
+            span.set_attribute("app.product_catalog.success", True)
+            logger.info(f"Successfully retrieved {len(product_ids)} products from catalog (attempt {attempt + 1})")
+            return product_ids
+            
+        except grpc.RpcError as e:
+            last_exception = e
+            status_code = e.code()
+            
+            span = trace.get_current_span()
+            span.set_attribute("app.product_catalog.error", True)
+            span.set_attribute("app.product_catalog.error_code", str(status_code))
+            span.set_attribute("app.product_catalog.attempt", attempt + 1)
+            
+            # Log the error with details
+            logger.warning(
+                f"Product catalog service unavailable (attempt {attempt + 1}/{max_retries}): "
+                f"status={status_code}, details={e.details()}"
+            )
+            
+            # Don't retry on certain error codes
+            if status_code in [grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.UNAUTHENTICATED]:
+                logger.error(f"Non-retryable error from product catalog: {status_code}")
+                break
+            
+            # If not the last attempt, wait before retrying with exponential backoff
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+        
+        except Exception as e:
+            last_exception = e
+            logger.error(f"Unexpected error calling product catalog (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+    
+    # All retries failed
+    span = trace.get_current_span()
+    span.set_attribute("app.product_catalog.all_retries_failed", True)
+    logger.error(f"All {max_retries} attempts to contact product catalog failed. Using fallback strategy.")
+    
+    # Return empty list as graceful degradation
+    return []
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,19 +155,41 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Use retry logic for product catalog call
+                response_ids = call_product_catalog_with_retry()
+                
+                # If we got products, update cache
+                if response_ids:
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                else:
+                    # Fallback to cached IDs if available
+                    if cached_ids:
+                        logger.info("Using cached product IDs as fallback")
+                        product_ids = cached_ids
+                    else:
+                        logger.warning("No cached products available, returning empty recommendations")
+                        return []
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            
+            # Use retry logic for product catalog call
+            product_ids = call_product_catalog_with_retry()
+            
+            # If product catalog is unavailable and we have cache, use it as fallback
+            if not product_ids and cached_ids:
+                logger.info("Product catalog unavailable, using cached products as fallback")
+                span.set_attribute("app.fallback_to_cache", True)
+                product_ids = cached_ids
+            elif not product_ids:
+                logger.warning("No products available from catalog or cache, returning empty recommendations")
+                return []
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -101,6 +197,12 @@ def get_product_list(request_product_ids):
         filtered_products = list(set(product_ids) - set(request_product_ids))
         num_products = len(filtered_products)
         span.set_attribute("app.filtered_products.count", num_products)
+        
+        # Handle case where we have no products to recommend
+        if num_products == 0:
+            logger.info("No products available for recommendation after filtering")
+            return []
+        
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
