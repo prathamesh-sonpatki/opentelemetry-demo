@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -39,6 +40,13 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Default product IDs to use as fallback when ProductCatalog is unavailable
+DEFAULT_PRODUCT_IDS = [
+    "OLJCESPC7Z", "66VCHSJNUP", "1YMWWN1N4O", "L9ECAV7KIM", 
+    "2ZYFJ3GM2N", "0PUK6V6EV0", "LS4PSXUNUM", "9SIQT8TOJO", 
+    "6E92ZMYYFZ"
+]
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
@@ -64,6 +72,64 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+def call_product_catalog_with_retry(max_retries=3, initial_delay=0.1):
+    """
+    Call ProductCatalog service with exponential backoff retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+        
+    Returns:
+        List of product IDs from catalog, or None if all retries failed
+    """
+    delay = initial_delay
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to fetch products from catalog (attempt {attempt + 1}/{max_retries})")
+            
+            # Call the ProductCatalog service
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=5.0  # 5 second timeout per request
+            )
+            
+            product_ids = [x.id for x in cat_response.products]
+            logger.info(f"Successfully fetched {len(product_ids)} products from catalog")
+            return product_ids
+            
+        except grpc.RpcError as e:
+            status_code = e.code()
+            logger.warning(
+                f"ProductCatalog gRPC call failed (attempt {attempt + 1}/{max_retries}): "
+                f"status={status_code}, details={e.details()}"
+            )
+            
+            # Don't retry on certain errors
+            if status_code in [grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND]:
+                logger.error(f"Non-retryable error from ProductCatalog: {status_code}")
+                return None
+            
+            # If this was the last attempt, return None
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} retry attempts failed for ProductCatalog")
+                return None
+            
+            # Wait before retrying (exponential backoff)
+            time.sleep(delay)
+            delay *= 2  # Double the delay for next retry
+            
+        except Exception as e:
+            logger.error(f"Unexpected error calling ProductCatalog: {type(e).__name__}: {e}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(delay)
+            delay *= 2
+    
+    return None
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,8 +147,18 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
+                
+                # Use retry logic for ProductCatalog call
+                response_ids = call_product_catalog_with_retry()
+                
+                if response_ids is None:
+                    # Fallback to default products if catalog is unavailable
+                    logger.warning("ProductCatalog unavailable, using default product list")
+                    span.set_attribute("app.product_catalog.fallback", True)
+                    response_ids = DEFAULT_PRODUCT_IDS
+                else:
+                    span.set_attribute("app.product_catalog.fallback", False)
+                
                 cached_ids = cached_ids + response_ids
                 cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
                 product_ids = cached_ids
@@ -92,8 +168,24 @@ def get_product_list(request_product_ids):
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            
+            # Use retry logic for ProductCatalog call
+            product_ids = call_product_catalog_with_retry()
+            
+            if product_ids is None:
+                # Fallback to cached products or defaults
+                if cached_ids:
+                    logger.warning("ProductCatalog unavailable, using cached product list")
+                    span.set_attribute("app.product_catalog.fallback", True)
+                    span.set_attribute("app.fallback_source", "cache")
+                    product_ids = cached_ids
+                else:
+                    logger.warning("ProductCatalog unavailable and no cache, using default product list")
+                    span.set_attribute("app.product_catalog.fallback", True)
+                    span.set_attribute("app.fallback_source", "defaults")
+                    product_ids = DEFAULT_PRODUCT_IDS
+            else:
+                span.set_attribute("app.product_catalog.fallback", False)
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -154,8 +246,24 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Configure gRPC channel with robust options
+    channel_options = [
+        ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive ack
+        ('grpc.keepalive_permit_without_calls', 1),  # Allow keepalive pings without calls
+        ('grpc.http2.max_pings_without_data', 0),  # No limit on pings without data
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # Min 10 seconds between pings
+        ('grpc.http2.min_ping_interval_without_data_ms', 30000),  # Min 30 seconds without data
+        ('grpc.enable_retries', 1),  # Enable gRPC retry support
+        ('grpc.max_connection_age_ms', 300000),  # Max connection age 5 minutes
+        ('grpc.max_connection_idle_ms', 60000),  # Close idle connections after 1 minute
+    ]
+    
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
+    
+    logger.info(f"Configured ProductCatalog gRPC channel to {catalog_addr} with robust connection options")
 
     # Create gRPC server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
