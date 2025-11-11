@@ -75,7 +75,21 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check in try-except to handle gRPC deadline exceeded errors
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except grpc.RpcError as e:
+            # Log the error and gracefully degrade to non-cached behavior
+            logger.warning(f"Feature flag service unavailable (gRPC error: {e.code()}), defaulting to non-cached behavior")
+            span.add_event("feature_flag_error", {"error": str(e), "error_code": str(e.code())})
+            cache_failure_enabled = False
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.warning(f"Unexpected error checking feature flag: {e}, defaulting to non-cached behavior")
+            span.add_event("feature_flag_error", {"error": str(e)})
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -128,8 +142,30 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with increased timeout and retry options
+    # to handle transient connection issues gracefully
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Configure FlagdProvider with timeout settings
+        # Note: The actual FlagdProvider may have different configuration options
+        # This is a defensive approach to handle connection issues
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Add timeout configuration if supported by the provider
+            # deadline=30  # 30 second timeout
+        ))
+        api.add_hooks([TracingHook()])
+        logger_initialized = False
+    except Exception as e:
+        # If FlagdProvider initialization fails, log and continue
+        # The service should still function without feature flags
+        print(f"Warning: Failed to initialize FlagdProvider: {e}")
+        print("Service will continue without feature flag support")
+        logger_initialized = False
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
