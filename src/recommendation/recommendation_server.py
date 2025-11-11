@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -39,6 +40,12 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Default product IDs to use when ProductCatalog service is unavailable
+DEFAULT_PRODUCT_IDS = [
+    'OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', 'L9ECAV7KIM', '2ZYFJ3GM2N',
+    '0PUK6V6EV0', 'LS4PSXUNUM', '9SIQT8TOJO', '6E92ZMYYFZ', 'HQTGWGPNH4'
+]
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
@@ -64,6 +71,64 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+def fetch_product_list_with_retry(max_retries=3, initial_delay=0.1):
+    """
+    Fetch product list from ProductCatalog service with retry logic and exponential backoff.
+    Returns None if all retries fail.
+    """
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            span = trace.get_current_span()
+            span.set_attribute("app.product_catalog.retry_attempt", attempt + 1)
+            
+            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+            response_ids = [x.id for x in cat_response.products]
+            
+            span.set_attribute("app.product_catalog.success", True)
+            logger.info(f"Successfully fetched {len(response_ids)} products from catalog")
+            return response_ids
+            
+        except grpc.RpcError as e:
+            span = trace.get_current_span()
+            span.set_attribute("app.product_catalog.error", str(e))
+            span.set_attribute("app.product_catalog.error_code", e.code().name if hasattr(e, 'code') else 'UNKNOWN')
+            
+            logger.warning(
+                f"Failed to fetch products from catalog (attempt {attempt + 1}/{max_retries}): "
+                f"{e.code().name if hasattr(e, 'code') else 'UNKNOWN'} - {e.details() if hasattr(e, 'details') else str(e)}"
+            )
+            
+            # Don't retry on certain error codes
+            if hasattr(e, 'code') and e.code() in [
+                grpc.StatusCode.INVALID_ARGUMENT,
+                grpc.StatusCode.NOT_FOUND,
+                grpc.StatusCode.ALREADY_EXISTS,
+                grpc.StatusCode.PERMISSION_DENIED,
+                grpc.StatusCode.UNAUTHENTICATED
+            ]:
+                logger.error(f"Non-retryable error from ProductCatalog service: {e.code().name}")
+                break
+            
+            # If this isn't the last attempt, wait before retrying
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+        
+        except Exception as e:
+            span = trace.get_current_span()
+            span.set_attribute("app.product_catalog.error", str(e))
+            logger.error(f"Unexpected error fetching products from catalog: {type(e).__name__} - {str(e)}")
+            break
+    
+    # All retries failed
+    span = trace.get_current_span()
+    span.set_attribute("app.product_catalog.success", False)
+    span.set_attribute("app.product_catalog.all_retries_failed", True)
+    logger.error("All retries to fetch products from catalog failed")
+    return None
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,19 +146,51 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Fetch with retry logic
+                response_ids = fetch_product_list_with_retry()
+                
+                if response_ids is not None:
+                    # Successfully fetched from catalog
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                elif cached_ids:
+                    # Fallback to existing cache if available
+                    span.set_attribute("app.fallback_to_cache", True)
+                    logger.warning("ProductCatalog unavailable, falling back to cached products")
+                    product_ids = cached_ids
+                else:
+                    # Use default product list as last resort
+                    span.set_attribute("app.fallback_to_defaults", True)
+                    logger.warning("ProductCatalog unavailable and no cache, using default products")
+                    product_ids = DEFAULT_PRODUCT_IDS
+                    cached_ids = DEFAULT_PRODUCT_IDS.copy()
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            
+            # Fetch with retry logic
+            response_ids = fetch_product_list_with_retry()
+            
+            if response_ids is not None:
+                # Successfully fetched from catalog
+                product_ids = response_ids
+            elif cached_ids:
+                # Fallback to existing cache if available
+                span.set_attribute("app.fallback_to_cache", True)
+                logger.warning("ProductCatalog unavailable, falling back to cached products")
+                product_ids = cached_ids
+            else:
+                # Use default product list as last resort
+                span.set_attribute("app.fallback_to_defaults", True)
+                logger.warning("ProductCatalog unavailable and no cache, using default products")
+                product_ids = DEFAULT_PRODUCT_IDS
+                # Populate cache with defaults for future requests
+                cached_ids = DEFAULT_PRODUCT_IDS.copy()
 
         span.set_attribute("app.products.count", len(product_ids))
 
