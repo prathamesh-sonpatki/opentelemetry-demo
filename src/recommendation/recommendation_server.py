@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -39,6 +40,11 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Retry configuration
+MAX_RETRY_ATTEMPTS = int(os.environ.get('GRPC_MAX_RETRY_ATTEMPTS', '3'))
+RETRY_INITIAL_BACKOFF_MS = int(os.environ.get('GRPC_RETRY_BACKOFF_MS', '100'))
+GRPC_TIMEOUT_SECONDS = int(os.environ.get('GRPC_TIMEOUT_SECONDS', '5'))
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
@@ -64,6 +70,85 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+def call_product_catalog_with_retry(request, max_attempts=MAX_RETRY_ATTEMPTS):
+    """
+    Call ProductCatalog service with exponential backoff retry logic.
+    
+    Args:
+        request: The gRPC request object
+        max_attempts: Maximum number of retry attempts
+        
+    Returns:
+        Response from ProductCatalog service or None if all retries fail
+    """
+    span = trace.get_current_span()
+    
+    for attempt in range(max_attempts):
+        try:
+            # Add timeout to prevent hanging connections
+            cat_response = product_catalog_stub.ListProducts(
+                request, 
+                timeout=GRPC_TIMEOUT_SECONDS
+            )
+            
+            # Success - reset any circuit breaker state
+            if attempt > 0:
+                logger.info(f"ProductCatalog call succeeded on retry attempt {attempt + 1}")
+                span.set_attribute("app.retry.success_attempt", attempt + 1)
+            
+            span.set_attribute("app.product_catalog.call_successful", True)
+            return cat_response
+            
+        except grpc.RpcError as e:
+            span.set_attribute("app.product_catalog.call_successful", False)
+            span.set_attribute("app.product_catalog.error_code", e.code().name if hasattr(e, 'code') else 'UNKNOWN')
+            
+            # Log the error with details
+            error_details = {
+                'attempt': attempt + 1,
+                'max_attempts': max_attempts,
+                'error_code': e.code().name if hasattr(e, 'code') else 'UNKNOWN',
+                'error_message': str(e)
+            }
+            
+            if attempt < max_attempts - 1:
+                # Calculate exponential backoff
+                backoff_ms = RETRY_INITIAL_BACKOFF_MS * (2 ** attempt)
+                backoff_seconds = backoff_ms / 1000.0
+                
+                logger.warning(
+                    f"ProductCatalog call failed (attempt {attempt + 1}/{max_attempts}): "
+                    f"{e.code().name if hasattr(e, 'code') else 'UNKNOWN'} - {str(e)}. "
+                    f"Retrying in {backoff_ms}ms..."
+                )
+                
+                span.set_attribute(f"app.retry.attempt_{attempt + 1}.backoff_ms", backoff_ms)
+                span.set_attribute(f"app.retry.attempt_{attempt + 1}.error", str(e))
+                
+                # Wait before retrying
+                time.sleep(backoff_seconds)
+            else:
+                # Final attempt failed
+                logger.error(
+                    f"ProductCatalog call failed after {max_attempts} attempts: "
+                    f"{e.code().name if hasattr(e, 'code') else 'UNKNOWN'} - {str(e)}"
+                )
+                span.set_attribute("app.retry.exhausted", True)
+                span.set_attribute("app.retry.final_error", str(e))
+                
+        except Exception as e:
+            # Catch any other unexpected exceptions
+            logger.error(f"Unexpected error calling ProductCatalog (attempt {attempt + 1}): {str(e)}")
+            span.set_attribute("app.product_catalog.unexpected_error", str(e))
+            
+            if attempt >= max_attempts - 1:
+                span.set_attribute("app.retry.exhausted", True)
+                break
+    
+    # All retries exhausted
+    return None
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,18 +166,44 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Use retry logic for ProductCatalog call
+                cat_response = call_product_catalog_with_retry(demo_pb2.Empty())
+                
+                if cat_response is None:
+                    # Fallback: Use cached IDs if available, otherwise return empty
+                    logger.warning("ProductCatalog unavailable, using fallback behavior")
+                    span.set_attribute("app.product_catalog.fallback_used", True)
+                    
+                    if cached_ids:
+                        logger.info("Using previously cached product IDs as fallback")
+                        product_ids = cached_ids
+                    else:
+                        logger.warning("No cached IDs available, returning empty recommendations")
+                        span.set_attribute("app.recommendations.empty_due_to_error", True)
+                        return []
+                else:
+                    response_ids = [x.id for x in cat_response.products]
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+            
+            # Use retry logic for ProductCatalog call
+            cat_response = call_product_catalog_with_retry(demo_pb2.Empty())
+            
+            if cat_response is None:
+                # Fallback: Return empty recommendations if ProductCatalog is unavailable
+                logger.warning("ProductCatalog unavailable, returning empty recommendations")
+                span.set_attribute("app.product_catalog.fallback_used", True)
+                span.set_attribute("app.recommendations.empty_due_to_error", True)
+                return []
+            
             product_ids = [x.id for x in cat_response.products]
 
         span.set_attribute("app.products.count", len(product_ids))
@@ -154,8 +265,23 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Configure gRPC channel with keepalive and timeout options
+    channel_options = [
+        ('grpc.keepalive_time_ms', 10000),
+        ('grpc.keepalive_timeout_ms', 5000),
+        ('grpc.keepalive_permit_without_calls', True),
+        ('grpc.http2.max_pings_without_data', 0),
+        ('grpc.http2.min_time_between_pings_ms', 10000),
+        ('grpc.http2.min_ping_interval_without_data_ms', 5000),
+    ]
+    
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
+    
+    logger.info(f"Configured ProductCatalog connection to {catalog_addr} with retry logic "
+                f"(max_attempts={MAX_RETRY_ATTEMPTS}, initial_backoff={RETRY_INITIAL_BACKOFF_MS}ms, "
+                f"timeout={GRPC_TIMEOUT_SECONDS}s)")
 
     # Create gRPC server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
