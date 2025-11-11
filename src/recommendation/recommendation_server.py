@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -81,26 +82,50 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Fetch products with retry logic and error handling
+                product_ids = fetch_products_with_retry()
+                
+                # Update cache if products were fetched successfully
+                if product_ids:
+                    cached_ids = cached_ids + product_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                else:
+                    # Fall back to cached data if available, otherwise use empty list
+                    logger.warning("Failed to fetch products from catalog, using cached data or empty list")
+                    product_ids = cached_ids if cached_ids else []
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            # Fetch products with retry logic and error handling
+            product_ids = fetch_products_with_retry()
+            
+            # If fetching failed and cache exists, use cached data
+            if not product_ids and cached_ids:
+                logger.warning("Failed to fetch products from catalog, falling back to cached data")
+                product_ids = cached_ids
 
         span.set_attribute("app.products.count", len(product_ids))
+
+        # If no products available, return empty list
+        if not product_ids:
+            logger.error("No products available for recommendations")
+            return []
 
         # Create a filtered list of products excluding the products received as input
         filtered_products = list(set(product_ids) - set(request_product_ids))
         num_products = len(filtered_products)
         span.set_attribute("app.filtered_products.count", num_products)
+        
+        # If no products to recommend after filtering, return empty list
+        if num_products == 0:
+            logger.info("No products to recommend after filtering")
+            return []
+            
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
@@ -111,6 +136,84 @@ def get_product_list(request_product_ids):
         span.set_attribute("app.filtered_products.list", prod_list)
 
         return prod_list
+
+
+def fetch_products_with_retry(max_retries=3, initial_delay=0.1, backoff_factor=2):
+    """
+    Fetch products from catalog service with exponential backoff retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries in seconds
+        backoff_factor: Multiplier for delay after each retry
+    
+    Returns:
+        List of product IDs or empty list if all retries failed
+    """
+    delay = initial_delay
+    
+    for attempt in range(max_retries):
+        try:
+            with tracer.start_as_current_span("fetch_products_from_catalog") as span:
+                span.set_attribute("retry.attempt", attempt + 1)
+                span.set_attribute("retry.max_attempts", max_retries)
+                
+                # Set a reasonable timeout for the gRPC call (5 seconds)
+                cat_response = product_catalog_stub.ListProducts(
+                    demo_pb2.Empty(),
+                    timeout=5.0
+                )
+                response_ids = [x.id for x in cat_response.products]
+                
+                span.set_attribute("products.fetched.count", len(response_ids))
+                logger.info(f"Successfully fetched {len(response_ids)} products from catalog")
+                return response_ids
+                
+        except grpc.RpcError as e:
+            span = trace.get_current_span()
+            span.set_attribute("error.occurred", True)
+            span.set_attribute("error.type", type(e).__name__)
+            
+            # Check if it's UNAVAILABLE status (connection refused, service down, etc.)
+            if e.code() == grpc.StatusCode.UNAVAILABLE:
+                logger.warning(
+                    f"Product catalog service unavailable (attempt {attempt + 1}/{max_retries}): {e.details()}"
+                )
+                span.set_attribute("error.grpc_status", "UNAVAILABLE")
+            # Check if it's DEADLINE_EXCEEDED (timeout)
+            elif e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+                logger.warning(
+                    f"Product catalog service timeout (attempt {attempt + 1}/{max_retries}): {e.details()}"
+                )
+                span.set_attribute("error.grpc_status", "DEADLINE_EXCEEDED")
+            else:
+                # Other gRPC errors
+                logger.error(
+                    f"Product catalog service error (attempt {attempt + 1}/{max_retries}): "
+                    f"code={e.code()}, details={e.details()}"
+                )
+                span.set_attribute("error.grpc_status", str(e.code()))
+            
+            # Don't retry on the last attempt
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay *= backoff_factor
+            else:
+                logger.error(f"Failed to fetch products after {max_retries} attempts")
+                span.record_exception(e)
+                
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.error(f"Unexpected error fetching products: {type(e).__name__}: {str(e)}")
+            span = trace.get_current_span()
+            span.set_attribute("error.occurred", True)
+            span.set_attribute("error.type", type(e).__name__)
+            span.record_exception(e)
+            break
+    
+    # Return empty list if all retries failed
+    return []
 
 
 def must_map_env(key: str):
