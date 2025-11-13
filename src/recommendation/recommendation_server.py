@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -64,6 +65,73 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+def call_product_catalog_with_retry(stub, max_retries=3, timeout=5):
+    """
+    Call product catalog service with exponential backoff retry logic.
+    
+    Args:
+        stub: gRPC stub for ProductCatalogService
+        max_retries: Maximum number of retry attempts (default: 3)
+        timeout: Timeout in seconds for each request (default: 5)
+    
+    Returns:
+        ListProductsResponse or None if all retries failed
+    """
+    for attempt in range(max_retries):
+        try:
+            # Add timeout to prevent hanging requests
+            cat_response = stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=timeout
+            )
+            if attempt > 0:
+                logger.info(f"Successfully connected to product catalog on attempt {attempt + 1}")
+            return cat_response
+            
+        except grpc.RpcError as e:
+            status_code = e.code()
+            error_details = e.details()
+            
+            # Log the error with trace context
+            span = trace.get_current_span()
+            trace_id = span.get_span_context().trace_id
+            logger.error(
+                f"gRPC error calling product catalog (attempt {attempt + 1}/{max_retries}): "
+                f"status={status_code}, details={error_details}, trace_id={trace_id:032x}"
+            )
+            
+            # Set error attributes on span
+            span.set_attribute("error", True)
+            span.set_attribute("error.type", str(status_code))
+            span.set_attribute("error.message", error_details)
+            span.set_attribute("retry.attempt", attempt + 1)
+            
+            # Check if we should retry
+            if status_code in [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED]:
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 0.5s, 1s, 2s
+                    backoff_time = 0.5 * (2 ** attempt)
+                    logger.warning(f"Retrying in {backoff_time}s...")
+                    time.sleep(backoff_time)
+                    continue
+                else:
+                    logger.error(
+                        f"Max retries ({max_retries}) reached for product catalog. "
+                        "Returning empty product list as fallback."
+                    )
+            else:
+                # Non-retryable error
+                logger.error(f"Non-retryable gRPC error: {status_code}. Returning empty product list.")
+                break
+                
+        except Exception as e:
+            # Catch any other unexpected errors
+            logger.error(f"Unexpected error calling product catalog: {str(e)}", exc_info=True)
+            break
+    
+    return None
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,26 +149,53 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                # Use retry logic for product catalog call
+                cat_response = call_product_catalog_with_retry(product_catalog_stub)
+                
+                if cat_response:
+                    response_ids = [x.id for x in cat_response.products]
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                else:
+                    # Fallback: use cached IDs if available, otherwise return empty
+                    logger.warning("Using cached IDs as fallback due to product catalog failure")
+                    product_ids = cached_ids if cached_ids else []
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            
+            # Use retry logic for product catalog call
+            cat_response = call_product_catalog_with_retry(product_catalog_stub)
+            
+            if cat_response:
+                product_ids = [x.id for x in cat_response.products]
+            else:
+                # Fallback: return empty list gracefully
+                logger.warning("Product catalog unavailable, returning empty recommendations")
+                span.set_attribute("app.fallback.empty_recommendations", True)
+                return []
 
         span.set_attribute("app.products.count", len(product_ids))
+
+        # Handle case where product_ids is empty
+        if not product_ids:
+            logger.info("No products available for recommendations")
+            return []
 
         # Create a filtered list of products excluding the products received as input
         filtered_products = list(set(product_ids) - set(request_product_ids))
         num_products = len(filtered_products)
         span.set_attribute("app.filtered_products.count", num_products)
+        
+        if num_products == 0:
+            logger.info("No products available after filtering")
+            return []
+            
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
@@ -121,15 +216,31 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for flagd connection issues.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log but don't fail if feature flag service is unavailable
+        logger.warning(f"Feature flag check failed for '{flag_name}': {str(e)}. Using default value False.")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flag provider with error handling
+    try:
+        api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+        api.add_hooks([TracingHook()])
+        logger_temp = logging.getLogger('main')
+        logger_temp.info("Feature flag provider initialized successfully")
+    except Exception as e:
+        logger_temp = logging.getLogger('main')
+        logger_temp.warning(f"Failed to initialize feature flag provider: {str(e)}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -154,7 +265,15 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Create channel with keepalive options for better connection stability
+    channel_options = [
+        ('grpc.keepalive_time_ms', 10000),
+        ('grpc.keepalive_timeout_ms', 5000),
+        ('grpc.keepalive_permit_without_calls', True),
+        ('grpc.http2.max_pings_without_data', 0),
+    ]
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
     # Create gRPC server
