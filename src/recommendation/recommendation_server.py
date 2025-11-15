@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -126,9 +127,86 @@ def check_feature_flag(flag_name: str):
     return client.get_boolean_value("recommendationCacheFailure", False)
 
 
+def initialize_flagd_provider_with_retry(max_retries=5, base_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and proper error handling.
+    
+    The flagd EventStream connection can timeout with DEADLINE_EXCEEDED errors.
+    This function adds retry logic with exponential backoff to handle transient failures.
+    
+    Args:
+        max_retries: Maximum number of retry attempts (default: 5)
+        base_delay: Base delay in seconds for exponential backoff (default: 1)
+    
+    Returns:
+        FlagdProvider instance or None if all retries fail
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Create FlagdProvider with extended deadline for streaming connections
+            # The EventStream is a long-lived connection that shouldn't timeout
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Set a very high deadline for the streaming connection (24 hours)
+                # This prevents DEADLINE_EXCEEDED errors on long-lived connections
+                deadline=86400000  # 24 hours in milliseconds
+            )
+            
+            api.set_provider(provider)
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return provider
+            
+        except grpc.RpcError as e:
+            # Handle gRPC specific errors (including DEADLINE_EXCEEDED)
+            delay = base_delay * (2 ** attempt)  # Exponential backoff
+            logger.warning(
+                f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): "
+                f"{e.code()} - {e.details()}. Retrying in {delay}s..."
+            )
+            
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts. "
+                    f"Feature flags will use default values."
+                )
+                # Return None to allow service to continue with default flag values
+                return None
+                
+        except Exception as e:
+            # Handle other unexpected errors
+            delay = base_delay * (2 ** attempt)
+            logger.warning(
+                f"Unexpected error connecting to flagd (attempt {attempt + 1}/{max_retries}): "
+                f"{type(e).__name__}: {str(e)}. Retrying in {delay}s..."
+            )
+            
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts due to unexpected errors. "
+                    f"Feature flags will use default values."
+                )
+                return None
+    
+    return None
+
+
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with retry logic and extended deadline
+    initialize_flagd_provider_with_retry()
+    
+    # Add OpenTelemetry tracing hook for feature flag operations
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
