@@ -121,15 +121,58 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for resilience.
+    
+    Returns the feature flag value or False if the flagd service is unavailable.
+    This prevents the recommendation service from failing when feature flag 
+    evaluation encounters errors like gRPC DEADLINE_EXCEEDED.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Attempt to get the feature flag value with a default of False
+        flag_value = client.get_boolean_value(flag_name, False)
+        return flag_value
+        
+    except Exception as e:
+        # Log the error for debugging but don't let it crash the service
+        logger.warning(
+            f"Feature flag evaluation failed for '{flag_name}': {type(e).__name__}: {str(e)}. "
+            f"Falling back to default value (False)."
+        )
+        
+        # Record the error in the current span if available
+        span = trace.get_current_span()
+        if span.is_recording():
+            span.set_attribute("app.feature_flag.error", True)
+            span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+            span.record_exception(e)
+        
+        # Return safe default value when feature flag service is unavailable
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with connection settings
+    # Using environment variables for host and port configuration
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        logger_temp = logging.getLogger('main')
+        logger_temp.info(f"Initializing FlagdProvider with host={flagd_host}, port={flagd_port}")
+        
+        api.set_provider(FlagdProvider(host=flagd_host, port=flagd_port))
+        api.add_hooks([TracingHook()])
+        
+        logger_temp.info("FlagdProvider initialized successfully")
+    except Exception as e:
+        logger_temp = logging.getLogger('main')
+        logger_temp.warning(f"Failed to initialize FlagdProvider: {type(e).__name__}: {str(e)}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
