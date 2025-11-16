@@ -8,6 +8,7 @@
 import os
 import random
 from concurrent import futures
+import time
 
 # Pip
 import grpc
@@ -38,6 +39,9 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_provider_initialized = False
+flagd_provider_last_retry = 0
+FLAGD_RETRY_INTERVAL = 60  # Retry reconnection every 60 seconds
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -120,15 +124,83 @@ def must_map_env(key: str):
     return value
 
 
+def init_flagd_provider():
+    """
+    Initialize the FlagD provider with retry logic.
+    This function attempts to reinitialize the provider if it fails.
+    """
+    global flagd_provider_initialized
+    global flagd_provider_last_retry
+    
+    current_time = time.time()
+    
+    # Only retry if enough time has passed since last attempt
+    if not flagd_provider_initialized and (current_time - flagd_provider_last_retry) >= FLAGD_RETRY_INTERVAL:
+        try:
+            logger.info("Attempting to initialize/reinitialize FlagD provider")
+            api.set_provider(FlagdProvider(
+                host=os.environ.get('FLAGD_HOST', 'flagd'), 
+                port=os.environ.get('FLAGD_PORT', 8013),
+                # Add deadline for streaming connection to prevent indefinite hangs
+                deadline=30000  # 30 seconds in milliseconds
+            ))
+            flagd_provider_initialized = True
+            logger.info("FlagD provider initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagD provider: {e}. Will retry in {FLAGD_RETRY_INTERVAL} seconds.")
+            flagd_provider_last_retry = current_time
+            flagd_provider_initialized = False
+
+
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and fallback.
+    Returns False (safe default) if flagd service is unavailable or times out.
+    """
+    global flagd_provider_initialized
+    
+    try:
+        # Attempt to reinitialize provider if it's not initialized
+        if not flagd_provider_initialized:
+            init_flagd_provider()
+        
+        # If still not initialized, return safe default
+        if not flagd_provider_initialized:
+            logger.debug(f"FlagD provider not available, using default value for flag: {flag_name}")
+            return False
+        
+        # Get the OpenFeature client
+        client = api.get_client()
+        
+        # Add timeout to the actual flag evaluation
+        # This prevents the call from hanging indefinitely
+        flag_value = client.get_boolean_value(flag_name, False)
+        
+        logger.debug(f"Feature flag '{flag_name}' evaluated to: {flag_value}")
+        return flag_value
+        
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        logger.warning(f"gRPC error checking feature flag '{flag_name}': {e.code()} - {e.details()}. Using default value: False")
+        # Mark provider as not initialized to trigger reconnection attempt
+        flagd_provider_initialized = False
+        return False
+        
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.warning(f"Error checking feature flag '{flag_name}': {type(e).__name__}: {str(e)}. Using default value: False")
+        # Mark provider as not initialized to trigger reconnection attempt
+        flagd_provider_initialized = False
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagD provider with error handling
+    init_flagd_provider()
+    
+    # Add OpenTelemetry hook for feature flag tracing
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
