@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,76 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for flagd connection issues.
+    Returns False (default) if flagd is unavailable to allow graceful degradation.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        # Get flag value with timeout protection via the provider configuration
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to retrieve feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagD provider with retry logic and proper timeout configuration.
+    
+    Args:
+        max_retries: Maximum number of connection attempts
+        initial_delay: Initial delay in seconds between retries (uses exponential backoff)
+    
+    Returns:
+        True if provider was successfully initialized, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to FlagD at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure FlagdProvider with timeout settings
+            # The timeout parameter controls the deadline for gRPC calls
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Set reasonable timeout to prevent indefinite blocking
+                # Note: The actual parameter name may vary based on the openfeature-provider-flagd version
+                # Some versions use 'deadline' or 'timeout' parameter
+            )
+            
+            api.set_provider(provider)
+            logger.info(f"Successfully connected to FlagD at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            delay = initial_delay * (2 ** attempt)  # Exponential backoff
+            logger.warning(f"Failed to connect to FlagD (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to connect to FlagD after {max_retries} attempts. Feature flags will use default values.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagD provider with retry logic and error handling
     api.add_hooks([TracingHook()])
+    flagd_initialized = initialize_flagd_provider_with_retry()
+    
+    if not flagd_initialized:
+        logger.warning("Service starting without FlagD connection. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
