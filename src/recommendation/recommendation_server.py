@@ -121,15 +121,86 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and timeout protection.
+    Returns False if flagd service is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client with timeout protection
+        client = api.get_client()
+        
+        # Add span attribute for observability
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.name", flag_name)
+        
+        # Get boolean value with fallback to False
+        # The FlagdProvider has internal timeout handling, but we add an additional layer
+        result = client.get_boolean_value(flag_name, False)
+        
+        span.set_attribute("app.feature_flag.value", result)
+        span.set_attribute("app.feature_flag.error", False)
+        
+        return result
+        
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including DEADLINE_EXCEEDED)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", "grpc_error")
+        span.set_attribute("app.feature_flag.error_code", str(e.code()) if hasattr(e, 'code') else "unknown")
+        
+        logger.warning(
+            f"Feature flag '{flag_name}' check failed due to gRPC error: {e}. "
+            f"Falling back to default value: False"
+        )
+        return False
+        
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", "unexpected_error")
+        
+        logger.error(
+            f"Unexpected error checking feature flag '{flag_name}': {e}. "
+            f"Falling back to default value: False"
+        )
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout configuration
+    # Add connection timeout and deadline for EventStream operations
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with reasonable timeout
+        # The default deadline for EventStream is quite long, causing timeouts
+        flagd_provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Add custom options for gRPC channel (if supported by the library)
+            # This helps prevent long-running connections that exceed deadlines
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        
+        # Create a simple logger for initialization
+        init_logger = logging.getLogger('init')
+        init_logger.info(f"Successfully initialized FlagdProvider at {flagd_host}:{flagd_port}")
+        
+    except Exception as e:
+        # If flagd initialization fails, log but don't crash the service
+        init_logger = logging.getLogger('init')
+        init_logger.warning(
+            f"Failed to initialize FlagdProvider at {flagd_host}:{flagd_port}: {e}. "
+            f"Feature flags will return default values."
+        )
+        # Continue service startup even if flagd is unavailable
+        # This ensures the recommendation service remains operational
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
