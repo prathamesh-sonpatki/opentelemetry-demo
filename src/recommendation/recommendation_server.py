@@ -123,13 +123,61 @@ def must_map_env(key: str):
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Use try-except to handle potential gRPC timeout errors gracefully
+    try:
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Failed to get feature flag '{flag_name}', using default: {e}")
+        return False
+
+
+def init_feature_flag_provider():
+    """
+    Initialize the feature flag provider with proper error handling and timeout configuration.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        logger.info(f"Initializing FlagdProvider with host={flagd_host}, port={flagd_port}")
+        
+        # Configure FlagdProvider with timeout and retry settings
+        # The FlagdProvider will establish a streaming connection to flagd
+        provider = FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Add deadline for stream operations to prevent indefinite hangs
+            deadline=30000  # 30 seconds timeout
+        )
+        
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        logger.info("FlagdProvider initialized successfully")
+        return True
+        
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        logger.error(f"gRPC error initializing FlagdProvider: {e.code()} - {e.details()}")
+        logger.warning("Feature flags will be disabled, using default values")
+        return False
+        
+    except Exception as e:
+        # Handle any other initialization errors
+        logger.error(f"Failed to initialize FlagdProvider: {type(e).__name__} - {str(e)}")
+        logger.warning("Feature flags will be disabled, using default values")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flag provider with error handling
+    # Service will continue to function even if flagd is unavailable
+    feature_flags_enabled = init_feature_flag_provider()
+    if not feature_flags_enabled:
+        logger.warning("Service starting without feature flag support")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
