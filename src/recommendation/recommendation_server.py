@@ -121,9 +121,42 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling for gRPC timeouts.
+    
+    Returns the feature flag value if available, or False as a safe default
+    if the flagd service is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Get the feature flag value with timeout handling
+        return client.get_boolean_value(flag_name, False)
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        span = trace.get_current_span()
+        if span:
+            span.set_attribute("app.feature_flag.error", True)
+            span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        
+        logger.warning(
+            f"Feature flag '{flag_name}' check failed due to gRPC error: {e.code()} - {e.details()}. "
+            f"Defaulting to False."
+        )
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        if span:
+            span.set_attribute("app.feature_flag.error", True)
+            span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        
+        logger.warning(
+            f"Feature flag '{flag_name}' check failed with unexpected error: {str(e)}. "
+            f"Defaulting to False."
+        )
+        return False
 
 
 if __name__ == "__main__":
