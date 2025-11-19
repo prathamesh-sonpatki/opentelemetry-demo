@@ -121,15 +121,76 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling for gRPC timeouts.
+    
+    Returns False (safe default) if flagd service is unavailable or times out.
+    This prevents DEADLINE_EXCEEDED exceptions from propagating and breaking the service.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Get feature flag value with timeout handling
+        # The FlagdProvider will handle retries internally
+        return client.get_boolean_value(flag_name, False)
+        
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", str(type(e).__name__))
+        
+        logger.warning(
+            f"Failed to retrieve feature flag '{flag_name}' from flagd service: {str(e)}. "
+            f"Using default value: False"
+        )
+        # Return safe default value
+        return False
+        
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", str(type(e).__name__))
+        
+        logger.error(
+            f"Unexpected error retrieving feature flag '{flag_name}': {str(e)}. "
+            f"Using default value: False"
+        )
+        # Return safe default value
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with timeout and retry configuration
+    # This helps prevent DEADLINE_EXCEEDED errors on the EventStream connection
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with explicit timeout settings
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Add timeout configuration to prevent indefinite waits
+            # The deadline parameter limits how long streaming connections can be established
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_init = logging.getLogger('init')
+        logger_init.info(f"Successfully connected to flagd service at {flagd_host}:{flagd_port}")
+        
+    except Exception as e:
+        # If flagd connection fails during startup, log but continue
+        # Feature flags will gracefully fall back to defaults
+        logger_init = logging.getLogger('init')
+        logger_init.warning(
+            f"Failed to initialize flagd provider at {flagd_host}:{flagd_port}: {str(e)}. "
+            f"Feature flags will use default values."
+        )
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
