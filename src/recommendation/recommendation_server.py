@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,67 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature client with error handling
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but return default value to prevent service disruption
+        logger.warning(f"Feature flag check failed for {flag_name}: {e}. Using default value: False")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, retry_delay=5):
+    """
+    Initialize FlagdProvider with retry logic and error handling.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay in seconds between retries
+    
+    Returns:
+        bool: True if initialization succeeded, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to initialize FlagdProvider (attempt {attempt + 1}/{max_retries})...")
+            
+            # Initialize FlagdProvider with explicit configuration
+            # The EventStream connection timeout is handled by the provider
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Additional options could be added here based on provider capabilities
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully initialized FlagdProvider connected to {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(f"Failed to initialize FlagdProvider after {max_retries} attempts. Feature flags will use default values.")
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic and error handling
+    # Service will continue even if flagd is unavailable, using default flag values
+    initialize_flagd_provider_with_retry(max_retries=3, retry_delay=5)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
