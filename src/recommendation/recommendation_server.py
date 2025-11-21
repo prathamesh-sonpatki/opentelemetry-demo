@@ -122,14 +122,42 @@ def must_map_env(key: str):
 
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value if flagd is unavailable
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with extended deadline and retry configuration
+    # The deadline is set to None (infinite) for the EventStream to prevent timeout issues
+    # EventStream is a long-running gRPC streaming connection for receiving feature flag updates
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Configure FlagdProvider with retry and extended timeouts
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=None,  # Set to None for infinite timeout on EventStream
+            keep_alive_time=30000,  # Keep-alive ping interval in ms (30 seconds)
+            stream_deadline_ms=0  # 0 means no deadline for streaming RPCs
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_init = logging.getLogger('init')
+        logger_init.info(f"FlagdProvider initialized successfully with host={flagd_host}, port={flagd_port}")
+    except Exception as e:
+        # If flagd initialization fails, continue without it
+        # Feature flags will return default values
+        logger_init = logging.getLogger('init')
+        logger_init.warning(f"Failed to initialize FlagdProvider: {e}. Feature flags will use default values.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
