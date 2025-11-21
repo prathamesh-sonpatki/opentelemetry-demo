@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,14 +122,68 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling for gRPC deadline exceeded errors.
+    Returns False (safe default) if flagd connection fails.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors gracefully, including DEADLINE_EXCEEDED
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag check timed out for '{flag_name}', using default value: False")
+        else:
+            logger.error(f"Feature flag check failed for '{flag_name}': {e}, using default value: False")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {e}, using default value: False")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, retry_delay=2):
+    """
+    Initialize FlagdProvider with retry logic to handle connection issues.
+    """
+    host = os.environ.get('FLAGD_HOST', 'flagd')
+    port = os.environ.get('FLAGD_PORT', 8013)
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing FlagdProvider (attempt {attempt + 1}/{max_retries})...")
+            
+            # Configure FlagdProvider with extended deadline and keepalive settings
+            provider = FlagdProvider(
+                host=host, 
+                port=port,
+                # Add keepalive settings to maintain long-running connections
+                options=(
+                    ('grpc.keepalive_time_ms', 120000),  # Send keepalive ping every 2 minutes
+                    ('grpc.keepalive_timeout_ms', 20000),  # Wait 20 seconds for keepalive response
+                    ('grpc.keepalive_permit_without_calls', True),  # Allow keepalive pings when no RPCs
+                    ('grpc.http2.max_pings_without_data', 0),  # Allow unlimited pings
+                )
+            )
+            
+            api.set_provider(provider)
+            logger.info("FlagdProvider initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                logger.error("Failed to initialize FlagdProvider after all retries. Feature flags will use default values.")
+                return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize FlagdProvider with retry logic and proper configuration
+    initialize_flagd_provider_with_retry()
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
