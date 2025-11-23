@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,10 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+feature_flag_provider = None
+feature_flag_retry_count = 0
+MAX_RETRY_ATTEMPTS = 5
+RETRY_BACKOFF_BASE = 2  # seconds
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -120,15 +125,92 @@ def must_map_env(key: str):
     return value
 
 
+def initialize_feature_flag_provider():
+    """
+    Initialize the feature flag provider with retry logic and error handling.
+    Handles gRPC DEADLINE_EXCEEDED errors that occur with long-running streams.
+    """
+    global feature_flag_provider
+    global feature_flag_retry_count
+    
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        logger.info(f"Initializing FlagdProvider (attempt {feature_flag_retry_count + 1}/{MAX_RETRY_ATTEMPTS})")
+        
+        # Create provider with timeout configuration
+        feature_flag_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port
+        )
+        
+        api.set_provider(feature_flag_provider)
+        feature_flag_retry_count = 0
+        logger.info("FlagdProvider initialized successfully")
+        
+    except grpc.RpcError as e:
+        # Handle gRPC errors including DEADLINE_EXCEEDED
+        feature_flag_retry_count += 1
+        
+        if feature_flag_retry_count < MAX_RETRY_ATTEMPTS:
+            backoff_time = RETRY_BACKOFF_BASE ** feature_flag_retry_count
+            logger.warning(
+                f"FlagdProvider connection failed: {e.code()} - {e.details()}. "
+                f"Retrying in {backoff_time} seconds (attempt {feature_flag_retry_count}/{MAX_RETRY_ATTEMPTS})"
+            )
+            time.sleep(backoff_time)
+            initialize_feature_flag_provider()  # Recursive retry
+        else:
+            logger.error(
+                f"FlagdProvider initialization failed after {MAX_RETRY_ATTEMPTS} attempts. "
+                "Feature flags will default to false values."
+            )
+            # Set a no-op provider to prevent crashes
+            feature_flag_provider = None
+            
+    except Exception as e:
+        logger.error(f"Unexpected error initializing FlagdProvider: {e}. Feature flags will default to false values.")
+        feature_flag_provider = None
+
+
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check a feature flag value with error handling and automatic reconnection.
+    Returns False if the flag service is unavailable.
+    """
+    global feature_flag_provider
+    
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value(flag_name, False)
+        
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including DEADLINE_EXCEEDED)
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(
+                f"Feature flag check deadline exceeded for '{flag_name}'. "
+                "Attempting to reinitialize connection..."
+            )
+            # Attempt to reinitialize the provider in the background
+            initialize_feature_flag_provider()
+        else:
+            logger.warning(f"Feature flag check failed for '{flag_name}': {e.details()}. Using default value.")
+        
+        # Return default value (False) on error
+        return False
+        
+    except Exception as e:
+        logger.warning(f"Unexpected error checking feature flag '{flag_name}': {e}. Using default value.")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
+    
+    # Initialize feature flag provider with retry logic
+    initialize_feature_flag_provider()
     api.add_hooks([TracingHook()])
 
     # Initialize Traces and Metrics
