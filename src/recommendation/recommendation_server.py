@@ -7,6 +7,8 @@
 # Python
 import os
 import random
+import time
+import functools
 from concurrent import futures
 
 # Pip
@@ -39,6 +41,65 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY_SECONDS = 1
+MAX_RETRY_DELAY_SECONDS = 10
+
+# Fallback product IDs when catalog is unavailable
+FALLBACK_PRODUCT_IDS = [
+    'OLJCESPC7Z', '66VCHSJNUP', '1YMWWN1N4O', 'L9ECAV7KIM',
+    '2ZYFJ3GM2N', '0PUK6V6EV0', 'LS4PSXUNUM', '9SIQT8TOJO'
+]
+
+def retry_on_grpc_error(max_retries=MAX_RETRIES, initial_delay=INITIAL_RETRY_DELAY_SECONDS):
+    """
+    Decorator to retry gRPC calls with exponential backoff.
+    Retries on UNAVAILABLE, DEADLINE_EXCEEDED, and UNKNOWN errors.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except grpc.RpcError as e:
+                    last_exception = e
+                    
+                    # Check if error is retryable
+                    if e.code() in [
+                        grpc.StatusCode.UNAVAILABLE,
+                        grpc.StatusCode.DEADLINE_EXCEEDED,
+                        grpc.StatusCode.UNKNOWN,
+                        grpc.StatusCode.INTERNAL,
+                    ]:
+                        if attempt < max_retries - 1:
+                            delay = min(initial_delay * (2 ** attempt), MAX_RETRY_DELAY_SECONDS)
+                            logger.warning(
+                                f"gRPC call {func.__name__} failed with {e.code()}, "
+                                f"attempt {attempt + 1}/{max_retries}. "
+                                f"Retrying in {delay}s... Error: {e.details()}"
+                            )
+                            time.sleep(delay)
+                        else:
+                            logger.error(
+                                f"gRPC call {func.__name__} failed after {max_retries} attempts. "
+                                f"Error: {e.code()} - {e.details()}"
+                            )
+                    else:
+                        # Non-retryable error, fail immediately
+                        logger.error(
+                            f"gRPC call {func.__name__} failed with non-retryable error: "
+                            f"{e.code()} - {e.details()}"
+                        )
+                        raise
+            
+            raise last_exception
+        return wrapper
+    return decorator
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
         prod_list = get_product_list(request.product_ids)
@@ -64,6 +125,17 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
 
 
+@retry_on_grpc_error(max_retries=MAX_RETRIES, initial_delay=INITIAL_RETRY_DELAY_SECONDS)
+def call_product_catalog_list_products():
+    """
+    Call ProductCatalog ListProducts with retry logic.
+    """
+    return product_catalog_stub.ListProducts(
+        demo_pb2.Empty(),
+        timeout=10  # 10 second timeout
+    )
+
+
 def get_product_list(request_product_ids):
     global first_run
     global cached_ids
@@ -81,19 +153,38 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                try:
+                    cat_response = call_product_catalog_list_products()
+                    response_ids = [x.id for x in cat_response.products]
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                except grpc.RpcError as e:
+                    logger.error(
+                        f"Failed to fetch products from catalog after retries: {e.code()} - {e.details()}. "
+                        f"Using fallback products."
+                    )
+                    span.set_attribute("app.product_catalog_unavailable", True)
+                    span.set_attribute("app.using_fallback", True)
+                    product_ids = FALLBACK_PRODUCT_IDS
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
-                product_ids = cached_ids
+                product_ids = cached_ids if cached_ids else FALLBACK_PRODUCT_IDS
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            try:
+                cat_response = call_product_catalog_list_products()
+                product_ids = [x.id for x in cat_response.products]
+            except grpc.RpcError as e:
+                logger.error(
+                    f"Failed to fetch products from catalog after retries: {e.code()} - {e.details()}. "
+                    f"Using fallback products."
+                )
+                span.set_attribute("app.product_catalog_unavailable", True)
+                span.set_attribute("app.using_fallback", True)
+                product_ids = FALLBACK_PRODUCT_IDS
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -104,9 +195,13 @@ def get_product_list(request_product_ids):
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
-        indices = random.sample(range(num_products), num_return)
-        # Fetch product ids from indices
-        prod_list = [filtered_products[i] for i in indices]
+        if num_products > 0:
+            indices = random.sample(range(num_products), num_return)
+            # Fetch product ids from indices
+            prod_list = [filtered_products[i] for i in indices]
+        else:
+            # Fallback to random subset of fallback products
+            prod_list = random.sample(FALLBACK_PRODUCT_IDS, min(max_responses, len(FALLBACK_PRODUCT_IDS)))
 
         span.set_attribute("app.filtered_products.list", prod_list)
 
@@ -154,7 +249,19 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Create gRPC channel with connection options
+    pc_channel = grpc.insecure_channel(
+        catalog_addr,
+        options=[
+            ('grpc.keepalive_time_ms', 10000),
+            ('grpc.keepalive_timeout_ms', 5000),
+            ('grpc.keepalive_permit_without_calls', True),
+            ('grpc.http2.max_pings_without_data', 0),
+            ('grpc.initial_reconnect_backoff_ms', 1000),
+            ('grpc.max_reconnect_backoff_ms', 5000),
+        ]
+    )
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
     # Create gRPC server
