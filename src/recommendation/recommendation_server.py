@@ -7,10 +7,12 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
 import grpc
+from grpc import StatusCode
 from opentelemetry import trace, metrics
 from opentelemetry._logs import set_logger_provider
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
@@ -38,6 +40,50 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_RETRY_DELAY = 0.1  # 100ms
+MAX_RETRY_DELAY = 2.0  # 2 seconds
+
+def retry_with_backoff(func, *args, max_retries=MAX_RETRIES, **kwargs):
+    """
+    Retry a function with exponential backoff.
+    Only retries on transient gRPC errors (UNAVAILABLE, DEADLINE_EXCEEDED).
+    """
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except grpc.RpcError as e:
+            last_exception = e
+            status_code = e.code()
+            
+            # Check if error is retryable
+            retryable_codes = [
+                StatusCode.UNAVAILABLE,
+                StatusCode.DEADLINE_EXCEEDED,
+                StatusCode.RESOURCE_EXHAUSTED,
+            ]
+            
+            if status_code not in retryable_codes or attempt == max_retries - 1:
+                logger.error(
+                    f"gRPC call failed (non-retryable or max retries): "
+                    f"code={status_code}, details={e.details()}, attempt={attempt + 1}"
+                )
+                raise
+            
+            # Calculate exponential backoff with jitter
+            delay = min(INITIAL_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.1), MAX_RETRY_DELAY)
+            logger.warning(
+                f"gRPC call failed (retrying): code={status_code}, "
+                f"details={e.details()}, attempt={attempt + 1}/{max_retries}, "
+                f"retry_delay={delay:.2f}s"
+            )
+            time.sleep(delay)
+    
+    raise last_exception
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -75,25 +121,55 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        try:
+            cache_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # If feature flag check fails, default to false and log warning
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {e}")
+            cache_enabled = False
+        
+        if cache_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
-                cached_ids = cached_ids + response_ids
-                cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
-                product_ids = cached_ids
+                
+                try:
+                    # Use retry logic for product catalog call
+                    cat_response = retry_with_backoff(
+                        product_catalog_stub.ListProducts,
+                        demo_pb2.Empty(),
+                        timeout=5.0  # 5 second timeout
+                    )
+                    response_ids = [x.id for x in cat_response.products]
+                    cached_ids = cached_ids + response_ids
+                    cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
+                    product_ids = cached_ids
+                except grpc.RpcError as e:
+                    logger.error(f"Failed to fetch products from catalog: {e}")
+                    # Return empty list on failure to prevent cascade failure
+                    span.set_attribute("app.products.fetch_failed", True)
+                    return []
             else:
                 span.set_attribute("app.cache_hit", True)
                 logger.info("get_product_list: cache hit")
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            try:
+                # Use retry logic for product catalog call
+                cat_response = retry_with_backoff(
+                    product_catalog_stub.ListProducts,
+                    demo_pb2.Empty(),
+                    timeout=5.0  # 5 second timeout
+                )
+                product_ids = [x.id for x in cat_response.products]
+            except grpc.RpcError as e:
+                logger.error(f"Failed to fetch products from catalog: {e}")
+                # Return empty list on failure to prevent cascade failure
+                span.set_attribute("app.products.fetch_failed", True)
+                return []
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -104,9 +180,12 @@ def get_product_list(request_product_ids):
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
-        indices = random.sample(range(num_products), num_return)
-        # Fetch product ids from indices
-        prod_list = [filtered_products[i] for i in indices]
+        if num_products > 0:
+            indices = random.sample(range(num_products), num_return)
+            # Fetch product ids from indices
+            prod_list = [filtered_products[i] for i in indices]
+        else:
+            prod_list = []
 
         span.set_attribute("app.filtered_products.list", prod_list)
 
@@ -121,15 +200,30 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Initialize OpenFeature with timeout protection
+    try:
+        client = api.get_client()
+        # Use a short timeout for feature flag checks to prevent blocking
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Feature flag check failed for '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flags with error handling
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        api.set_provider(FlagdProvider(host=flagd_host, port=flagd_port))
+        api.add_hooks([TracingHook()])
+        logger = logging.getLogger('main')
+        logger.info(f"Connected to feature flag service at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        logger = logging.getLogger('main')
+        logger.warning(f"Failed to initialize feature flag provider: {e}. Feature flags will be disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -154,8 +248,21 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Create gRPC channel with keepalive and connection timeout settings
+    channel_options = [
+        ('grpc.keepalive_time_ms', 30000),  # Send keepalive ping every 30 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive ack
+        ('grpc.keepalive_permit_without_calls', 1),  # Allow keepalive pings when no calls
+        ('grpc.http2.max_pings_without_data', 0),  # Allow unlimited pings without data
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # Minimum 10 seconds between pings
+        ('grpc.http2.min_ping_interval_without_data_ms', 30000),  # 30 seconds without data
+    ]
+    
+    pc_channel = grpc.insecure_channel(catalog_addr, options=channel_options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
+    
+    logger.info(f"Connected to Product Catalog service at {catalog_addr}")
 
     # Create gRPC server
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
