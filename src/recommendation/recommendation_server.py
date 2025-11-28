@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -39,21 +40,35 @@ from metrics import (
 cached_ids = []
 first_run = True
 
+# Default product IDs to use as fallback when catalog service is unavailable
+DEFAULT_PRODUCT_IDS = [
+    "OLJCESPC7Z", "66VCHSJNUP", "1YMWWN1N4O", "L9ECAV7KIM",
+    "2ZYFJ3GM2N", "0PUK6V6EV0", "LS4PSXUNUM", "9SIQT8TOJO", "6E92ZMYYFZ"
+]
+
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
-        prod_list = get_product_list(request.product_ids)
-        span = trace.get_current_span()
-        span.set_attribute("app.products_recommended.count", len(prod_list))
-        logger.info(f"Receive ListRecommendations for product ids:{prod_list}")
+        try:
+            prod_list = get_product_list(request.product_ids)
+            span = trace.get_current_span()
+            span.set_attribute("app.products_recommended.count", len(prod_list))
+            logger.info(f"Receive ListRecommendations for product ids:{prod_list}")
 
-        # build and return response
-        response = demo_pb2.ListRecommendationsResponse()
-        response.product_ids.extend(prod_list)
+            # build and return response
+            response = demo_pb2.ListRecommendationsResponse()
+            response.product_ids.extend(prod_list)
 
-        # Collect metrics for this service
-        rec_svc_metrics["app_recommendations_counter"].add(len(prod_list), {'recommendation.type': 'catalog'})
+            # Collect metrics for this service
+            rec_svc_metrics["app_recommendations_counter"].add(len(prod_list), {'recommendation.type': 'catalog'})
 
-        return response
+            return response
+        except Exception as e:
+            # Log the error but don't crash the service
+            logger.error(f"Error in ListRecommendations: {e}", exc_info=True)
+            span = trace.get_current_span()
+            span.record_exception(e)
+            # Return empty recommendations instead of crashing
+            return demo_pb2.ListRecommendationsResponse()
 
     def Check(self, request, context):
         return health_pb2.HealthCheckResponse(
@@ -62,6 +77,67 @@ class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def Watch(self, request, context):
         return health_pb2.HealthCheckResponse(
             status=health_pb2.HealthCheckResponse.UNIMPLEMENTED)
+
+
+def get_product_list_with_retry(max_retries=3, initial_delay=0.1):
+    """
+    Fetch product list from catalog with exponential backoff retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds before first retry
+    
+    Returns:
+        List of product IDs or default list if all retries fail
+    """
+    delay = initial_delay
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Add timeout to prevent hanging
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=5.0  # 5 second timeout
+            )
+            return [x.id for x in cat_response.products]
+        except grpc.RpcError as e:
+            last_exception = e
+            status_code = e.code()
+            
+            # Log the error with attempt number
+            logger.warning(
+                f"Failed to fetch products from catalog (attempt {attempt + 1}/{max_retries}): "
+                f"{status_code.name} - {e.details()}"
+            )
+            
+            # Don't retry on certain error types
+            if status_code in [grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED]:
+                logger.error(f"Non-retryable error: {status_code.name}")
+                break
+            
+            # If not the last attempt, wait before retrying
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+        except Exception as e:
+            last_exception = e
+            logger.error(f"Unexpected error fetching products (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+    
+    # All retries failed, log and return fallback
+    logger.error(
+        f"All retries failed to fetch products from catalog. Using fallback product list. "
+        f"Last error: {last_exception}"
+    )
+    span = trace.get_current_span()
+    span.set_attribute("app.catalog_fallback_used", True)
+    if last_exception:
+        span.record_exception(last_exception)
+    
+    return DEFAULT_PRODUCT_IDS
 
 
 def get_product_list(request_product_ids):
@@ -75,14 +151,22 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # If feature flag check fails, default to disabled
+            logger.warning(f"Failed to check feature flag, defaulting to disabled: {e}")
+            cache_failure_enabled = False
+            span.set_attribute("app.feature_flag_check_failed", True)
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-                response_ids = [x.id for x in cat_response.products]
+                # Use retry logic for catalog fetch
+                response_ids = get_product_list_with_retry()
                 cached_ids = cached_ids + response_ids
                 cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
                 product_ids = cached_ids
@@ -92,8 +176,8 @@ def get_product_list(request_product_ids):
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
-            product_ids = [x.id for x in cat_response.products]
+            # Use retry logic for catalog fetch
+            product_ids = get_product_list_with_retry()
 
         span.set_attribute("app.products.count", len(product_ids))
 
@@ -101,6 +185,13 @@ def get_product_list(request_product_ids):
         filtered_products = list(set(product_ids) - set(request_product_ids))
         num_products = len(filtered_products)
         span.set_attribute("app.filtered_products.count", num_products)
+        
+        # Handle edge case where filtered products is empty
+        if num_products == 0:
+            logger.warning("No products available after filtering")
+            span.set_attribute("app.empty_recommendations", True)
+            return []
+        
         num_return = min(max_responses, num_products)
 
         # Sample list of indicies to return
@@ -121,15 +212,43 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling and timeout.
+    
+    Returns:
+        Boolean value of the feature flag, or False if check fails
+    """
+    try:
+        client = api.get_client()
+        # Add timeout to prevent hanging
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagD provider with increased timeout to prevent DEADLINE_EXCEEDED
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Set provider with more resilient configuration
+        api.set_provider(FlagdProvider(
+            host=flagd_host, 
+            port=flagd_port,
+            # Increase deadline to prevent DEADLINE_EXCEEDED errors
+            deadline=30000  # 30 seconds instead of default 10
+        ))
+        api.add_hooks([TracingHook()])
+        logger_init = logging.getLogger('init')
+        logger_init.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # Don't crash if flagd is unavailable, just log and continue
+        logger_init = logging.getLogger('init')
+        logger_init.warning(f"Failed to initialize flagd provider: {e}. Feature flags will be disabled.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -154,7 +273,15 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    
+    # Create gRPC channel with keep-alive settings to prevent connection issues
+    options = [
+        ('grpc.keepalive_time_ms', 10000),
+        ('grpc.keepalive_timeout_ms', 5000),
+        ('grpc.keepalive_permit_without_calls', True),
+        ('grpc.http2.max_pings_without_data', 0),
+    ]
+    pc_channel = grpc.insecure_channel(catalog_addr, options=options)
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
     # Create gRPC server
