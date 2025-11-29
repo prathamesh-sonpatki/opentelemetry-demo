@@ -121,15 +121,47 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with graceful error handling.
+    Returns False (default) if flagd connection fails.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't crash the service
+        logger.warning(f"Failed to retrieve feature flag '{flag_name}': {e}")
+        logger.warning("Falling back to default value: False")
+        return False
+
+
+def init_flagd_provider():
+    """
+    Initialize FlagdProvider with error handling and retry logic.
+    Service should continue to operate even if flagd is unavailable.
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        logger.info(f"Connecting to flagd at {flagd_host}:{flagd_port}")
+        provider = FlagdProvider(host=flagd_host, port=flagd_port)
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        logger.info("Successfully connected to flagd service")
+    except Exception as e:
+        # Don't crash the service if flagd is unavailable
+        logger.error(f"Failed to connect to flagd: {e}")
+        logger.warning("Service will continue with default feature flag values")
+        # Note: OpenFeature will use the default provider which returns default values
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with error handling
+    init_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
