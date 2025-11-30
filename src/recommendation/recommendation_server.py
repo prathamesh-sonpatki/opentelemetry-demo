@@ -75,7 +75,14 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # If feature flag service is unavailable, default to False
+            logger.warning(f"Failed to check feature flag, defaulting to False: {e}")
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -128,8 +135,31 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with error handling and timeout configuration
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        
+        # Initialize provider with explicit configuration
+        # Set a reasonable timeout to prevent deadline exceeded errors
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Add timeout configuration to prevent DEADLINE_EXCEEDED
+            # Default timeout is often too short for EventStream
+            deadline=30000  # 30 seconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger = logging.getLogger('main')
+        logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # Log the error but don't crash the service
+        # Feature flags will default to their fallback values
+        logger = logging.getLogger('main')
+        logger.error(f"Failed to initialize flagd provider: {e}")
+        logger.warning("Service will continue with default feature flag values")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
