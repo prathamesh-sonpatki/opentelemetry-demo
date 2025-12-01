@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,78 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling.
+    Returns False if flagd is unavailable to allow graceful degradation.
+    """
+    try:
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error but don't fail the request
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}")
+        return False
+
+
+def initialize_flagd_provider_with_retry(max_retries=3, initial_delay=1):
+    """
+    Initialize FlagdProvider with retry logic and proper error handling.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles with each retry)
+    
+    Returns:
+        bool: True if initialization successful, False otherwise
+    """
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    # Configure deadline for flagd connection (default 30 seconds)
+    flagd_deadline = int(os.environ.get('FLAGD_DEADLINE_MS', 30000))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port} (attempt {attempt + 1}/{max_retries})")
+            
+            # Initialize FlagdProvider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=flagd_deadline
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            logger.info(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+            return True
+            
+        except Exception as e:
+            delay = initial_delay * (2 ** attempt)
+            logger.warning(
+                f"Failed to connect to flagd (attempt {attempt + 1}/{max_retries}): {e}. "
+                f"Retrying in {delay} seconds..."
+            )
+            
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts. "
+                    "Service will continue without feature flags (using defaults)."
+                )
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with retry logic
+    # Service continues even if flagd is unavailable
+    initialize_flagd_provider_with_retry(max_retries=3, initial_delay=2)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
