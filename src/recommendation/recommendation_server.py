@@ -75,7 +75,16 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Wrap feature flag check in try-except to handle timeout gracefully
+        try:
+            cache_failure_enabled = check_feature_flag("recommendationCacheFailure")
+        except Exception as e:
+            # Log warning but continue with default behavior (cache disabled)
+            logger.warning(f"Failed to check feature flag 'recommendationCacheFailure': {str(e)}. Using default value: False")
+            span.set_attribute("app.feature_flag.error", str(e))
+            cache_failure_enabled = False
+
+        if cache_failure_enabled:
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,6 +130,10 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
+    """
+    Check feature flag value with timeout handling.
+    Raises exception if flagd is unavailable or times out.
+    """
     # Initialize OpenFeature
     client = api.get_client()
     return client.get_boolean_value("recommendationCacheFailure", False)
@@ -128,8 +141,19 @@ def check_feature_flag(flag_name: str):
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with error handling
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+        api.set_provider(FlagdProvider(host=flagd_host, port=flagd_port))
+        api.add_hooks([TracingHook()])
+        print(f"Successfully connected to flagd at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # Log warning but allow service to continue
+        # Feature flags will use default values
+        print(f"Warning: Failed to initialize flagd provider: {str(e)}")
+        print("Service will continue with default feature flag values")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
