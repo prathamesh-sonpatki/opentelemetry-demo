@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -121,15 +122,67 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with proper error handling and timeout protection.
+    Returns False if flagd service is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        
+        # Attempt to get the feature flag value with a reasonable timeout
+        # The timeout is handled by the FlagdProvider configuration
+        flag_value = client.get_boolean_value(flag_name, False)
+        return flag_value
+    except grpc.RpcError as e:
+        # Handle gRPC-specific errors (including timeout)
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag check timed out for '{flag_name}', using default value: False")
+        else:
+            logger.warning(f"Feature flag check failed for '{flag_name}' with gRPC error: {e.code()}, using default value: False")
+        
+        # Return default value when feature flag service is unavailable
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        span = trace.get_current_span()
+        span.set_attribute("app.feature_flag.error", True)
+        span.set_attribute("app.feature_flag.error_type", type(e).__name__)
+        
+        logger.warning(f"Unexpected error checking feature flag '{flag_name}': {str(e)}, using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with proper timeout and retry settings
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Set timeout to 5 seconds to prevent long-running gRPC calls
+    # This prevents the DEADLINE_EXCEEDED exceptions from blocking the service
+    flagd_timeout = int(os.environ.get('FLAGD_TIMEOUT_MS', 5000))
+    
+    try:
+        # Initialize FlagdProvider with timeout configuration
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            deadline=flagd_timeout  # Set deadline in milliseconds
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger_init = logging.getLogger('init')
+        logger_init.info(f"FlagdProvider initialized successfully with host={flagd_host}, port={flagd_port}, timeout={flagd_timeout}ms")
+    except Exception as e:
+        # If FlagdProvider initialization fails, continue without feature flags
+        logger_init = logging.getLogger('init')
+        logger_init.error(f"Failed to initialize FlagdProvider: {str(e)}. Service will continue without feature flags.")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
