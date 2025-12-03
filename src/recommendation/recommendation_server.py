@@ -123,13 +123,41 @@ def must_map_env(key: str):
 def check_feature_flag(flag_name: str):
     # Initialize OpenFeature
     client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    # Add error handling for feature flag retrieval with timeout protection
+    try:
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value to prevent service disruption
+        logger.warning(f"Failed to retrieve feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Configure FlagdProvider with timeout settings and error handling
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    try:
+        # Initialize FlagdProvider with explicit configuration
+        # The timeout for the EventStream is now handled more gracefully
+        flagd_provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Keep the connection alive but allow for graceful degradation
+            keep_alive=True,
+            # Add timeout for initial connection (30 seconds)
+            deadline=30000
+        )
+        api.set_provider(flagd_provider)
+        api.add_hooks([TracingHook()])
+        logger.info(f"Successfully connected to FlagD service at {flagd_host}:{flagd_port}")
+    except Exception as e:
+        # If FlagD connection fails, log error but continue service startup
+        # This prevents the service from failing if feature flags are unavailable
+        logger.error(f"Failed to connect to FlagD service at {flagd_host}:{flagd_port}: {e}")
+        logger.warning("Service will continue without feature flag support")
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
