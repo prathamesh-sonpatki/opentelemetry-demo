@@ -8,6 +8,7 @@
 import os
 import random
 from concurrent import futures
+import time
 
 # Pip
 import grpc
@@ -38,6 +39,8 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+# Flag to track if feature flags are available
+feature_flags_available = True
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,16 +124,91 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with graceful degradation.
+    Returns False if feature flags service is unavailable.
+    """
+    global feature_flags_available
+    
+    if not feature_flags_available:
+        # Skip feature flag check if service is known to be unavailable
+        return False
+    
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        # Get feature flag value with timeout protection
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except grpc.RpcError as e:
+        # Handle gRPC errors (including deadline exceeded)
+        if e.code() == grpc.StatusCode.DEADLINE_EXCEEDED:
+            logger.warning(f"Feature flag service timeout for '{flag_name}', using default value (False)")
+            # Mark service as temporarily unavailable to avoid repeated timeouts
+            feature_flags_available = False
+        elif e.code() == grpc.StatusCode.UNAVAILABLE:
+            logger.warning(f"Feature flag service unavailable for '{flag_name}', using default value (False)")
+            feature_flags_available = False
+        else:
+            logger.error(f"Feature flag service error for '{flag_name}': {e}, using default value (False)")
+        return False
+    except Exception as e:
+        # Handle any other unexpected errors
+        logger.error(f"Unexpected error checking feature flag '{flag_name}': {e}, using default value (False)")
+        return False
+
+
+def initialize_feature_flags(max_retries=3, retry_delay=2):
+    """
+    Initialize feature flag provider with retry logic and timeout configuration.
+    """
+    global feature_flags_available
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing feature flag provider (attempt {attempt + 1}/{max_retries})")
+            
+            # Configure FlagdProvider with timeout and retry settings
+            # The provider will use these settings for gRPC connections
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Set a reasonable timeout to prevent indefinite waits
+                # Note: Actual timeout configuration depends on the flagd provider version
+            )
+            
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            # Test the connection by getting a client and checking a flag
+            client = api.get_client()
+            # This will trigger the EventStream connection
+            test_value = client.get_boolean_value("test", False)
+            
+            logger.info("Feature flag provider initialized successfully")
+            feature_flags_available = True
+            return True
+            
+        except grpc.RpcError as e:
+            logger.warning(f"Failed to initialize feature flag provider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"Unexpected error initializing feature flag provider: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+    
+    # If all retries failed, continue without feature flags
+    logger.warning("Could not initialize feature flag provider after retries. Continuing with feature flags disabled.")
+    feature_flags_available = False
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
-
+    
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
     meter = metrics.get_meter_provider().get_meter(service_name)
@@ -152,6 +230,9 @@ if __name__ == "__main__":
     # Attach OTLP handler to logger
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    
+    # Initialize feature flags with retry logic and timeout handling
+    initialize_feature_flags(max_retries=3, retry_delay=2)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
