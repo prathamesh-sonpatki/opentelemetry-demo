@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_available = False
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +123,96 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag value with fallback to default if flagd is unavailable.
+    """
+    global flagd_available
+    if not flagd_available:
+        # Flagd is unavailable, return default value
+        return False
+    
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # If flag evaluation fails, log and return default
+        logger.warning(f"Failed to evaluate feature flag '{flag_name}', using default value: {e}")
+        return False
+
+
+def initialize_flagd_provider(max_retries=3, initial_delay=1.0, max_delay=10.0):
+    """
+    Initialize FlagdProvider with retry logic and exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay between retries in seconds
+        max_delay: Maximum delay between retries in seconds
+    
+    Returns:
+        bool: True if initialization successful, False otherwise
+    """
+    global flagd_available
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    # Configure gRPC options with timeouts
+    grpc_options = [
+        ('grpc.keepalive_time_ms', 5000),  # Send keepalive ping every 5 seconds
+        ('grpc.keepalive_timeout_ms', 10000),  # Wait 10 seconds for keepalive response
+        ('grpc.keepalive_permit_without_calls', True),  # Allow keepalive pings without active calls
+        ('grpc.http2.max_pings_without_data', 0),  # Unlimited pings
+        ('grpc.http2.min_time_between_pings_ms', 5000),  # Minimum 5 seconds between pings
+        ('grpc.http2.min_ping_interval_without_data_ms', 5000),  # Minimum 5 seconds between pings without data
+    ]
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to initialize FlagdProvider (attempt {attempt + 1}/{max_retries})")
+            
+            # Create FlagdProvider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                deadline=30000,  # 30 second deadline for gRPC calls
+                keep_alive=True
+            )
+            
+            # Set the provider
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            # Test the connection by getting a client
+            client = api.get_client()
+            
+            logger.info(f"Successfully initialized FlagdProvider at {flagd_host}:{flagd_port}")
+            flagd_available = True
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize FlagdProvider (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                # Calculate delay with exponential backoff
+                delay = min(initial_delay * (2 ** attempt), max_delay)
+                logger.info(f"Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error(f"Failed to initialize FlagdProvider after {max_retries} attempts. "
+                           f"Service will continue without feature flag support.")
+                flagd_available = False
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with retry logic
+    initialize_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
