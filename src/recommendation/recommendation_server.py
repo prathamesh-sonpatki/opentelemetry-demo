@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+flagd_available = True  # Track flagd service availability
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -121,15 +123,106 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with graceful degradation.
+    If flagd service is unavailable, return False (default behavior).
+    Includes retry logic with exponential backoff for transient failures.
+    """
+    global flagd_available
+    
+    # If flagd is known to be unavailable, return default value immediately
+    if not flagd_available:
+        return False
+    
+    max_retries = 2
+    retry_delay = 0.1  # Start with 100ms
+    
+    for attempt in range(max_retries + 1):
+        try:
+            # Initialize OpenFeature client
+            client = api.get_client()
+            
+            # Set a reasonable timeout for the flag evaluation
+            # This prevents hanging on slow connections
+            result = client.get_boolean_value(flag_name, False)
+            
+            # If successful, ensure flagd_available is True
+            flagd_available = True
+            return result
+            
+        except grpc.RpcError as e:
+            # Handle gRPC-specific errors (DEADLINE_EXCEEDED, UNAVAILABLE, etc.)
+            if e.code() in (grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.UNAVAILABLE):
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Feature flag check failed (attempt {attempt + 1}/{max_retries + 1}): "
+                        f"{e.code()}, retrying in {retry_delay}s..."
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    # Mark flagd as unavailable to avoid future attempts for some time
+                    flagd_available = False
+                    logger.error(
+                        f"Feature flag service unavailable after {max_retries + 1} attempts. "
+                        f"Returning default value (False) for flag '{flag_name}'. "
+                        f"Error: {e.code()} - {e.details()}"
+                    )
+                    return False
+            else:
+                # For other gRPC errors, log and return default
+                logger.error(f"Unexpected gRPC error checking feature flag '{flag_name}': {e.code()} - {e.details()}")
+                return False
+                
+        except Exception as e:
+            # Catch any other exceptions (e.g., connection errors, timeouts)
+            logger.error(f"Error checking feature flag '{flag_name}': {str(e)}", exc_info=True)
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                return False
+    
+    # Fallback: return default value
+    return False
+
+
+def initialize_flagd_provider():
+    """
+    Initialize FlagdProvider with proper timeout and error handling.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+        flagd_port = int(os.environ.get('FLAGD_PORT', '8013'))
+        
+        logger.info(f"Initializing FlagdProvider with host={flagd_host}, port={flagd_port}")
+        
+        # Initialize provider with timeout configuration
+        provider = FlagdProvider(
+            host=flagd_host,
+            port=flagd_port,
+            # Set reasonable timeout to prevent indefinite hanging
+            deadline=5000  # 5 second timeout in milliseconds
+        )
+        
+        api.set_provider(provider)
+        api.add_hooks([TracingHook()])
+        
+        logger.info("FlagdProvider initialized successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize FlagdProvider: {str(e)}", exc_info=True)
+        logger.warning("Service will continue with feature flags disabled")
+        return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize FlagdProvider with proper error handling
+    flagd_available = initialize_flagd_provider()
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
