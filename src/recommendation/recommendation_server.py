@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,7 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+feature_flags_enabled = False  # Track if feature flags are available
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -75,7 +77,8 @@ def get_product_list(request_product_ids):
         request_product_ids = request_product_ids_str.split(',')
 
         # Feature flag scenario - Cache Leak
-        if check_feature_flag("recommendationCacheFailure"):
+        # Only check feature flag if the service is available
+        if feature_flags_enabled and check_feature_flag("recommendationCacheFailure"):
             span.set_attribute("app.recommendation.cache_enabled", True)
             if random.random() < 0.5 or first_run:
                 first_run = False
@@ -121,15 +124,83 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling.
+    Returns False if feature flags are not available.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log error but don't crash the service
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}")
+        return False
+
+
+def initialize_feature_flags_with_retry(max_retries=3, retry_delay=2):
+    """
+    Initialize feature flags with retry logic and graceful degradation.
+    
+    Args:
+        max_retries: Maximum number of connection attempts
+        retry_delay: Delay in seconds between retries
+    
+    Returns:
+        bool: True if initialization succeeded, False otherwise
+    """
+    global feature_flags_enabled
+    
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    
+    logger.info(f"Attempting to connect to flagd at {flagd_host}:{flagd_port}")
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Set provider with timeout configuration
+            provider = FlagdProvider(
+                host=flagd_host,
+                port=flagd_port,
+                # Add deadline for operations to prevent indefinite blocking
+                deadline=5000  # 5 seconds timeout
+            )
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            
+            # Test the connection by attempting to get a flag value
+            client = api.get_client()
+            # This will raise an exception if the connection fails
+            _ = client.get_boolean_value("test", False)
+            
+            logger.info("Successfully connected to flagd service")
+            feature_flags_enabled = True
+            return True
+            
+        except Exception as e:
+            logger.warning(
+                f"Attempt {attempt}/{max_retries} to connect to flagd failed: {e}"
+            )
+            
+            if attempt < max_retries:
+                logger.info(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logger.error(
+                    f"Failed to connect to flagd after {max_retries} attempts. "
+                    "Feature flags will be disabled. Service will continue with default behavior."
+                )
+                feature_flags_enabled = False
+                return False
+    
+    return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize feature flags with retry and graceful degradation
+    initialize_feature_flags_with_retry(max_retries=3, retry_delay=2)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
