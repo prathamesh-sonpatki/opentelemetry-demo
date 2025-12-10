@@ -11,10 +11,21 @@ type TResponse = Ad[] | Empty;
 const handler = async ({ method, query }: NextApiRequest, res: NextApiResponse<TResponse>) => {
   switch (method) {
     case 'GET': {
-      const { contextKeys = [] } = query;
-      const { ads: adList } = await AdGateway.listAds(Array.isArray(contextKeys) ? contextKeys : contextKeys.split(','));
+      try {
+        const { contextKeys = [] } = query;
+        const { ads: adList } = await AdGateway.listAds(
+          Array.isArray(contextKeys) ? contextKeys : contextKeys.split(',')
+        );
 
-      return res.status(200).json(adList);
+        return res.status(200).json(adList);
+      } catch (error: any) {
+        // Log error for observability
+        console.error('Failed to fetch ads:', error.message);
+        
+        // Return empty array instead of 500 error - graceful degradation
+        // The page can still load without ads
+        return res.status(200).json([]);
+      }
     }
 
     default: {
