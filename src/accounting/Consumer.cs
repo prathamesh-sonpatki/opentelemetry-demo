@@ -88,6 +88,14 @@ internal class Consumer : IDisposable
                 return;
             }
 
+            // Check if order already exists to prevent duplicate key violations
+            var existingOrder = _dbContext.Orders.FirstOrDefault(o => o.Id == order.OrderId);
+            if (existingOrder != null)
+            {
+                _logger.LogWarning("Order {OrderId} already exists in database. Skipping duplicate processing.", order.OrderId);
+                return;
+            }
+
             var orderEntity = new OrderEntity
             {
                 Id = order.OrderId
