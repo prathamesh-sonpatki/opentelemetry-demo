@@ -88,6 +88,15 @@ internal class Consumer : IDisposable
                 return;
             }
 
+            // Check if order already exists (idempotency check)
+            // This prevents duplicate key violations when Kafka messages are redelivered
+            var existingOrder = _dbContext.Orders.FirstOrDefault(o => o.Id == order.OrderId);
+            if (existingOrder != null)
+            {
+                _logger.LogInformation("Order {OrderId} already processed, skipping duplicate", order.OrderId);
+                return;
+            }
+
             var orderEntity = new OrderEntity
             {
                 Id = order.OrderId
