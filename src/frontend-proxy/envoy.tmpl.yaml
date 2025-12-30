@@ -62,7 +62,16 @@ static_resources:
                             upgrade_configs:
                               - upgrade_type: websocket
                         - match: { prefix: "/" } # Default/catch-all route - keep last since prefix:"/" matches everything
-                          route: { cluster: frontend }
+                          route: 
+                            cluster: frontend
+                            # Add retry policy for frontend cluster to handle transient failures
+                            retry_policy:
+                              retry_on: "5xx,connect-failure,refused-stream,reset"
+                              num_retries: 3
+                              per_try_timeout: 5s
+                              retry_host_predicate:
+                                - name: envoy.retry_host_predicates.previous_hosts
+                              host_selection_retry_max_attempts: 3
                 http_filters:
                   - name: envoy.filters.http.fault
                     typed_config:
@@ -161,6 +170,36 @@ static_resources:
     - name: frontend
       type: STRICT_DNS
       lb_policy: ROUND_ROBIN
+      # Add health check to detect unhealthy frontend instances
+      health_checks:
+        - timeout: 2s
+          interval: 10s
+          interval_jitter: 1s
+          unhealthy_threshold: 3
+          healthy_threshold: 2
+          http_health_check:
+            path: "/"
+            # Expect 2xx status code (200 OK is typical for frontend root)
+            expected_statuses:
+              - start: 200
+                end: 299
+      # Add circuit breaker to prevent cascading failures
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 1000
+            max_pending_requests: 1000
+            max_requests: 1000
+            max_retries: 3
+      # Add outlier detection to temporarily remove unhealthy endpoints
+      outlier_detection:
+        consecutive_5xx: 5
+        interval: 10s
+        base_ejection_time: 30s
+        max_ejection_percent: 50
+        enforcing_consecutive_5xx: 100
+      # Add connection timeout settings
+      connect_timeout: 5s
       load_assignment:
         cluster_name: frontend
         endpoints:
