@@ -88,6 +88,14 @@ internal class Consumer : IDisposable
                 return;
             }
 
+            // Idempotency check: Skip if order already exists to prevent duplicate key violations
+            var existingOrder = _dbContext.Orders.FirstOrDefault(o => o.Id == order.OrderId);
+            if (existingOrder != null)
+            {
+                _logger.LogInformation("Order {OrderId} already exists in database, skipping to maintain idempotency", order.OrderId);
+                return;
+            }
+
             var orderEntity = new OrderEntity
             {
                 Id = order.OrderId
@@ -123,6 +131,8 @@ internal class Consumer : IDisposable
             };
             _dbContext.Add(shipping);
             _dbContext.SaveChanges();
+            
+            _logger.LogInformation("Successfully processed order {OrderId}", order.OrderId);
         }
         catch (Exception ex)
         {
