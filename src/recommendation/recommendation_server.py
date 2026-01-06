@@ -121,9 +121,26 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check if a feature flag is enabled.
+    
+    Args:
+        flag_name: Name of the feature flag to check
+        
+    Returns:
+        Boolean value of the feature flag (defaults to False if not found)
+    """
+    try:
+        # Initialize OpenFeature client
+        client = api.get_client()
+        # Use the actual flag_name parameter instead of hardcoded value
+        flag_value = client.get_boolean_value(flag_name, False)
+        logger.debug(f"Feature flag '{flag_name}' evaluated to: {flag_value}")
+        return flag_value
+    except Exception as e:
+        # Log the error and return default value
+        logger.warning(f"Error checking feature flag '{flag_name}': {e}. Using default value: False")
+        return False
 
 
 if __name__ == "__main__":
@@ -136,7 +153,7 @@ if __name__ == "__main__":
     meter = metrics.get_meter_provider().get_meter(service_name)
     rec_svc_metrics = init_metrics(meter)
 
-    # Initialize Logs
+    # Initialize Logs BEFORE using logger
     logger_provider = LoggerProvider(
         resource=Resource.create(
             {
@@ -149,9 +166,10 @@ if __name__ == "__main__":
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
     handler = LoggingHandler(level=logging.NOTSET, logger_provider=logger_provider)
 
-    # Attach OTLP handler to logger
+    # Attach OTLP handler to logger and set it up BEFORE any usage
     logger = logging.getLogger('main')
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
     pc_channel = grpc.insecure_channel(catalog_addr)
