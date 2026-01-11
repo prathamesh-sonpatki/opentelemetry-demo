@@ -88,11 +88,21 @@ internal class Consumer : IDisposable
                 return;
             }
 
+            // Check if order already exists to handle idempotency
+            // This prevents duplicate key constraint violations when messages are reprocessed
+            var existingOrder = _dbContext.Orders.Find(order.OrderId);
+            if (existingOrder != null)
+            {
+                _logger.LogInformation($"Order {order.OrderId} already exists in database, skipping insert to maintain idempotency");
+                return;
+            }
+
             var orderEntity = new OrderEntity
             {
                 Id = order.OrderId
             };
             _dbContext.Add(orderEntity);
+            
             foreach (var item in order.Items)
             {
                 var orderItem = new OrderItemEntity
@@ -122,7 +132,17 @@ internal class Consumer : IDisposable
                 OrderId = order.OrderId
             };
             _dbContext.Add(shipping);
-            _dbContext.SaveChanges();
+            
+            try
+            {
+                _dbContext.SaveChanges();
+            }
+            catch (DbUpdateException ex) when (ex.InnerException?.Message?.Contains("order_pkey") == true)
+            {
+                // Handle race condition where order was inserted between check and insert
+                _logger.LogWarning($"Order {order.OrderId} was inserted concurrently, skipping due to race condition");
+                // Don't throw - this is an expected race condition in distributed systems
+            }
         }
         catch (Exception ex)
         {
