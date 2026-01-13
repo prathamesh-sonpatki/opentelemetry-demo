@@ -88,41 +88,62 @@ internal class Consumer : IDisposable
                 return;
             }
 
-            var orderEntity = new OrderEntity
+            // FIX: Check if order already exists to ensure idempotent processing
+            // This prevents PostgreSQL unique constraint violations (23505) that occur
+            // when Kafka redelivers messages or when there are concurrent order processing attempts
+            var orderExists = _dbContext.Orders.Any(o => o.Id == order.OrderId);
+            if (orderExists)
             {
-                Id = order.OrderId
-            };
-            _dbContext.Add(orderEntity);
-            foreach (var item in order.Items)
-            {
-                var orderItem = new OrderItemEntity
-                {
-                    ItemCostCurrencyCode = item.Cost.CurrencyCode,
-                    ItemCostUnits = item.Cost.Units,
-                    ItemCostNanos = item.Cost.Nanos,
-                    ProductId = item.Item.ProductId,
-                    Quantity = item.Item.Quantity,
-                    OrderId = order.OrderId
-                };
-
-                _dbContext.Add(orderItem);
+                _logger.LogWarning("Order {OrderId} already exists in database, skipping duplicate insertion", order.OrderId);
+                return;
             }
 
-            var shipping = new ShippingEntity
+            try
             {
-                ShippingTrackingId = order.ShippingTrackingId,
-                ShippingCostCurrencyCode = order.ShippingCost.CurrencyCode,
-                ShippingCostUnits = order.ShippingCost.Units,
-                ShippingCostNanos = order.ShippingCost.Nanos,
-                StreetAddress = order.ShippingAddress.StreetAddress,
-                City = order.ShippingAddress.City,
-                State = order.ShippingAddress.State,
-                Country = order.ShippingAddress.Country,
-                ZipCode = order.ShippingAddress.ZipCode,
-                OrderId = order.OrderId
-            };
-            _dbContext.Add(shipping);
-            _dbContext.SaveChanges();
+                var orderEntity = new OrderEntity
+                {
+                    Id = order.OrderId
+                };
+                _dbContext.Add(orderEntity);
+                
+                foreach (var item in order.Items)
+                {
+                    var orderItem = new OrderItemEntity
+                    {
+                        ItemCostCurrencyCode = item.Cost.CurrencyCode,
+                        ItemCostUnits = item.Cost.Units,
+                        ItemCostNanos = item.Cost.Nanos,
+                        ProductId = item.Item.ProductId,
+                        Quantity = item.Item.Quantity,
+                        OrderId = order.OrderId
+                    };
+
+                    _dbContext.Add(orderItem);
+                }
+
+                var shipping = new ShippingEntity
+                {
+                    ShippingTrackingId = order.ShippingTrackingId,
+                    ShippingCostCurrencyCode = order.ShippingCost.CurrencyCode,
+                    ShippingCostUnits = order.ShippingCost.Units,
+                    ShippingCostNanos = order.ShippingCost.Nanos,
+                    StreetAddress = order.ShippingAddress.StreetAddress,
+                    City = order.ShippingAddress.City,
+                    State = order.ShippingAddress.State,
+                    Country = order.ShippingAddress.Country,
+                    ZipCode = order.ShippingAddress.ZipCode,
+                    OrderId = order.OrderId
+                };
+                _dbContext.Add(shipping);
+                _dbContext.SaveChanges();
+                
+                _logger.LogInformation("Successfully processed and saved order {OrderId}", order.OrderId);
+            }
+            catch (DbUpdateException dbEx) when (dbEx.InnerException?.Message.Contains("23505") == true)
+            {
+                // Handle race condition where order was inserted between check and save
+                _logger.LogWarning(dbEx, "Duplicate key violation for order {OrderId}, order was likely inserted by concurrent process", order.OrderId);
+            }
         }
         catch (Exception ex)
         {
