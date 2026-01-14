@@ -7,6 +7,7 @@
 # Python
 import os
 import random
+import time
 from concurrent import futures
 
 # Pip
@@ -38,6 +39,12 @@ from metrics import (
 
 cached_ids = []
 first_run = True
+# Default timeout for gRPC calls (in seconds)
+GRPC_TIMEOUT_SECONDS = 5
+# Maximum retries for flagd connection
+MAX_FLAGD_RETRIES = 3
+# Retry delay in seconds
+RETRY_DELAY_SECONDS = 1
 
 class RecommendationService(demo_pb2_grpc.RecommendationServiceServicer):
     def ListRecommendations(self, request, context):
@@ -81,7 +88,10 @@ def get_product_list(request_product_ids):
                 first_run = False
                 span.set_attribute("app.cache_hit", False)
                 logger.info("get_product_list: cache miss")
-                cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+                cat_response = product_catalog_stub.ListProducts(
+                    demo_pb2.Empty(),
+                    timeout=GRPC_TIMEOUT_SECONDS
+                )
                 response_ids = [x.id for x in cat_response.products]
                 cached_ids = cached_ids + response_ids
                 cached_ids = cached_ids + cached_ids[:len(cached_ids) // 4]
@@ -92,7 +102,10 @@ def get_product_list(request_product_ids):
                 product_ids = cached_ids
         else:
             span.set_attribute("app.recommendation.cache_enabled", False)
-            cat_response = product_catalog_stub.ListProducts(demo_pb2.Empty())
+            cat_response = product_catalog_stub.ListProducts(
+                demo_pb2.Empty(),
+                timeout=GRPC_TIMEOUT_SECONDS
+            )
             product_ids = [x.id for x in cat_response.products]
 
         span.set_attribute("app.products.count", len(product_ids))
@@ -121,15 +134,56 @@ def must_map_env(key: str):
 
 
 def check_feature_flag(flag_name: str):
-    # Initialize OpenFeature
-    client = api.get_client()
-    return client.get_boolean_value("recommendationCacheFailure", False)
+    """
+    Check feature flag with error handling and fallback to default value.
+    Returns False if flagd is unavailable or times out.
+    """
+    try:
+        # Initialize OpenFeature
+        client = api.get_client()
+        return client.get_boolean_value("recommendationCacheFailure", False)
+    except Exception as e:
+        # Log the error and return default value
+        logger.warning(f"Failed to check feature flag '{flag_name}': {e}. Using default value: False")
+        return False
+
+
+def initialize_flagd_provider(host: str, port: int, max_retries: int = MAX_FLAGD_RETRIES):
+    """
+    Initialize flagd provider with retry logic and timeout configuration.
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Initializing flagd provider (attempt {attempt + 1}/{max_retries})...")
+            # Set timeout for flagd provider initialization
+            provider = FlagdProvider(
+                host=host,
+                port=port,
+                deadline=GRPC_TIMEOUT_SECONDS * 1000  # Convert to milliseconds
+            )
+            api.set_provider(provider)
+            api.add_hooks([TracingHook()])
+            logger.info("Successfully initialized flagd provider")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to initialize flagd provider (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                delay = RETRY_DELAY_SECONDS * (2 ** attempt)
+                logger.info(f"Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                logger.error("Failed to initialize flagd provider after all retries. Feature flags will use default values.")
+                return False
 
 
 if __name__ == "__main__":
     service_name = must_map_env('OTEL_SERVICE_NAME')
-    api.set_provider(FlagdProvider(host=os.environ.get('FLAGD_HOST', 'flagd'), port=os.environ.get('FLAGD_PORT', 8013)))
-    api.add_hooks([TracingHook()])
+    
+    # Initialize flagd provider with retry logic
+    flagd_host = os.environ.get('FLAGD_HOST', 'flagd')
+    flagd_port = int(os.environ.get('FLAGD_PORT', 8013))
+    initialize_flagd_provider(flagd_host, flagd_port)
 
     # Initialize Traces and Metrics
     tracer = trace.get_tracer_provider().get_tracer(service_name)
@@ -154,7 +208,16 @@ if __name__ == "__main__":
     logger.addHandler(handler)
 
     catalog_addr = must_map_env('PRODUCT_CATALOG_ADDR')
-    pc_channel = grpc.insecure_channel(catalog_addr)
+    # Configure gRPC channel with keepalive settings to prevent hanging connections
+    pc_channel = grpc.insecure_channel(
+        catalog_addr,
+        options=[
+            ('grpc.keepalive_time_ms', 30000),
+            ('grpc.keepalive_timeout_ms', 10000),
+            ('grpc.keepalive_permit_without_calls', True),
+            ('grpc.http2.max_pings_without_data', 0),
+        ]
+    )
     product_catalog_stub = demo_pb2_grpc.ProductCatalogServiceStub(pc_channel)
 
     # Create gRPC server
